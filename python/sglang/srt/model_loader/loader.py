@@ -237,6 +237,21 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        if model_config.quantization == "litelinear":
+            from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
+
+            extra_config = load_config.model_loader_extra_config or {}
+            checkpoint_mode = str(
+                extra_config.get("litelinear_checkpoint_mode", "dense")
+            ).strip()
+            if isinstance(quant_config, LiteLinearConfig) and (
+                checkpoint_mode in ("online_patch", "strict")
+                or extra_config.get("litelinear_online_patch", False)
+                or extra_config.get("litelinear_strict_patch", False)
+            ):
+                quant_config.load_dense_weight = False
+                if "litelinear_rank" in extra_config:
+                    quant_config.rank = int(extra_config["litelinear_rank"])
         # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
@@ -367,7 +382,19 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
+        allowed_keys = {
+            "enable_multithread_load",
+            "num_threads",
+            "litelinear_checkpoint_mode",
+            "litelinear_online_patch",
+            "litelinear_strict_patch",
+            "litelinear_patch_cache_root",
+            "litelinear_patch_config_path",
+            "litelinear_patch_tag",
+            "litelinear_patch_copy_original",
+            "litelinear_patch_force_rebuild",
+            "litelinear_rank",
+        }
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -530,6 +557,15 @@ class DefaultModelLoader(BaseModelLoader):
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
             )
+            if source.model_config.quantization == "litelinear":
+                from sglang.srt.layers.quantization.litelinear import (
+                    maybe_resolve_litelinear_patched_weights,
+                )
+
+                hf_weights_files = maybe_resolve_litelinear_patched_weights(
+                    hf_weights_files,
+                    extra_config,
+                )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
