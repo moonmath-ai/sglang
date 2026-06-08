@@ -6,6 +6,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.litelinear import (
+    LiteLinearConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
     ModelOptFp8Config as ModelOptFp8DiffusionConfig,
 )
@@ -29,6 +32,7 @@ QuantizationMethods = Literal[
     "mxfp8",
     "mxfp4",
     "mxfp4_npu",
+    "litelinear",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -43,6 +47,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "mxfp4": Mxfp4Config,
     "mxfp8": MXFP8Config,
     "mxfp4_npu": NPUMXFP4Config,
+    "litelinear": LiteLinearConfig,
 }
 
 

@@ -30,6 +30,17 @@ class LiteLinearConfig(QuantizationConfig):
     DEFAULT_MIN_INPUT_SIZE = 4096
     DEFAULT_MIN_OUTPUT_RATIO = 2.0
     DEFAULT_MAX_OUTPUT_RATIO = 12.0
+    MODEL_LOADER_EXTRA_CONFIG_KEYS = [
+        "litelinear_checkpoint_mode",
+        "litelinear_online_patch",
+        "litelinear_strict_patch",
+        "litelinear_patch_cache_root",
+        "litelinear_patch_config_path",
+        "litelinear_patch_tag",
+        "litelinear_patch_copy_original",
+        "litelinear_patch_force_rebuild",
+        "litelinear_rank",
+    ]
 
     def __init__(
         self,
@@ -133,6 +144,30 @@ class LiteLinearConfig(QuantizationConfig):
                     True,
                 )
             ),
+        )
+
+    @classmethod
+    def get_model_loader_extra_config_keys(cls) -> List[str]:
+        return cls.MODEL_LOADER_EXTRA_CONFIG_KEYS
+
+    def update_from_model_loader_extra_config(
+        self, model_loader_extra_config: Dict[str, Any]
+    ) -> None:
+        checkpoint_mode = _get_checkpoint_mode(model_loader_extra_config)
+        if checkpoint_mode in ("online_patch", "strict"):
+            self.load_dense_weight = False
+            if "litelinear_rank" in model_loader_extra_config:
+                self.rank = int(model_loader_extra_config["litelinear_rank"])
+
+    @classmethod
+    def maybe_process_safetensors_files(
+        cls,
+        hf_weights_files: List[str],
+        model_loader_extra_config: Dict[str, Any],
+    ) -> List[str]:
+        return maybe_resolve_litelinear_patched_weights(
+            hf_weights_files,
+            model_loader_extra_config,
         )
 
     def get_quant_method(
@@ -421,13 +456,7 @@ def maybe_resolve_litelinear_patched_weights(
     hf_weights_files: List[str],
     model_loader_extra_config: Dict[str, Any],
 ) -> List[str]:
-    checkpoint_mode = str(
-        model_loader_extra_config.get("litelinear_checkpoint_mode", "dense")
-    ).strip()
-    if model_loader_extra_config.get("litelinear_online_patch", False):
-        checkpoint_mode = "online_patch"
-    if model_loader_extra_config.get("litelinear_strict_patch", False):
-        checkpoint_mode = "strict"
+    checkpoint_mode = _get_checkpoint_mode(model_loader_extra_config)
     if checkpoint_mode in ("", "dense", "none"):
         return hf_weights_files
     if checkpoint_mode not in ("online_patch", "strict"):
@@ -503,6 +532,17 @@ def maybe_resolve_litelinear_patched_weights(
         resolved_files.append(str(resolved_path))
 
     return resolved_files
+
+
+def _get_checkpoint_mode(model_loader_extra_config: Dict[str, Any]) -> str:
+    checkpoint_mode = str(
+        model_loader_extra_config.get("litelinear_checkpoint_mode", "dense")
+    ).strip()
+    if model_loader_extra_config.get("litelinear_online_patch", False):
+        checkpoint_mode = "online_patch"
+    if model_loader_extra_config.get("litelinear_strict_patch", False):
+        checkpoint_mode = "strict"
+    return checkpoint_mode
 
 
 def _make_lite_linear(

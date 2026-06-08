@@ -80,6 +80,25 @@ class TestLiteLinearConfig(CustomTestCase):
 
         self.assertIs(get_quantization_config("litelinear"), LiteLinearConfig)
 
+    def test_model_loader_extra_config_selects_factor_loading(self):
+        from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
+
+        config = LiteLinearConfig(rank=16)
+        self.assertIn(
+            "litelinear_checkpoint_mode",
+            LiteLinearConfig.get_model_loader_extra_config_keys(),
+        )
+
+        config.update_from_model_loader_extra_config(
+            {
+                "litelinear_checkpoint_mode": "strict",
+                "litelinear_rank": 32,
+            }
+        )
+
+        self.assertFalse(config.load_dense_weight)
+        self.assertEqual(config.rank, 32)
+
     def test_default_policy_uses_shape_not_name(self):
         from sglang.srt.layers.linear import ReplicatedLinear
         from sglang.srt.layers.quantization.litelinear import (

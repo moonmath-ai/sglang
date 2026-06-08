@@ -37,12 +37,14 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
 try:
@@ -74,6 +76,10 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization import (
+    QUANTIZATION_METHODS,
+    get_quantization_config,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -82,6 +88,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
+from sglang.srt.utils.common import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -237,21 +244,9 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        if model_config.quantization == "litelinear":
-            from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
-
-            extra_config = load_config.model_loader_extra_config or {}
-            checkpoint_mode = str(
-                extra_config.get("litelinear_checkpoint_mode", "dense")
-            ).strip()
-            if isinstance(quant_config, LiteLinearConfig) and (
-                checkpoint_mode in ("online_patch", "strict")
-                or extra_config.get("litelinear_online_patch", False)
-                or extra_config.get("litelinear_strict_patch", False)
-            ):
-                quant_config.load_dense_weight = False
-                if "litelinear_rank" in extra_config:
-                    quant_config.rank = int(extra_config["litelinear_rank"])
+        quant_config.update_from_model_loader_extra_config(
+            load_config.model_loader_extra_config or {}
+        )
         # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
@@ -385,16 +380,9 @@ class DefaultModelLoader(BaseModelLoader):
         allowed_keys = {
             "enable_multithread_load",
             "num_threads",
-            "litelinear_checkpoint_mode",
-            "litelinear_online_patch",
-            "litelinear_strict_patch",
-            "litelinear_patch_cache_root",
-            "litelinear_patch_config_path",
-            "litelinear_patch_tag",
-            "litelinear_patch_copy_original",
-            "litelinear_patch_force_rebuild",
-            "litelinear_rank",
         }
+        for quant_config_cls in QUANTIZATION_METHODS.values():
+            allowed_keys.update(quant_config_cls.get_model_loader_extra_config_keys())
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -557,12 +545,11 @@ class DefaultModelLoader(BaseModelLoader):
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
             )
-            if source.model_config.quantization == "litelinear":
-                from sglang.srt.layers.quantization.litelinear import (
-                    maybe_resolve_litelinear_patched_weights,
+            if source.model_config.quantization is not None:
+                quant_config_cls = get_quantization_config(
+                    source.model_config.quantization
                 )
-
-                hf_weights_files = maybe_resolve_litelinear_patched_weights(
+                hf_weights_files = quant_config_cls.maybe_process_safetensors_files(
                     hf_weights_files,
                     extra_config,
                 )
@@ -782,7 +769,28 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            peak_memory = torch.cuda.max_memory_allocated()
+            logger.debug(
+                "Peak GPU memory before loading weights: %s GiB",
+                f"{peak_memory / GIB_BYTES:.3f}",
+            )
+            memory_start = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+
         model.load_weights(weights)
+
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            memory_end = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+            logger.debug(
+                "Memory increase during load_weights: %s GiB",
+                f"{memory_start - memory_end:.3f}",
+            )
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
