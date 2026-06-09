@@ -80,23 +80,33 @@ class TestLiteLinearConfig(CustomTestCase):
 
         self.assertIs(get_quantization_config("litelinear"), LiteLinearConfig)
 
-    def test_model_loader_extra_config_selects_factor_loading(self):
+    def test_model_loader_extra_config_selects_factor_checkpoint_format(self):
         from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
 
         config = LiteLinearConfig(rank=16)
         self.assertIn(
-            "litelinear_checkpoint_mode",
+            "litelinear_checkpoint_format",
             LiteLinearConfig.get_model_loader_extra_config_keys(),
         )
 
         config.update_from_model_loader_extra_config(
+            {"litelinear_checkpoint_format": "factors"}
+        )
+
+        self.assertEqual(config.checkpoint_format, "factors")
+
+    def test_from_config_selects_factor_checkpoint_format(self):
+        from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
+
+        config = LiteLinearConfig.from_config(
             {
-                "litelinear_checkpoint_mode": "strict",
-                "litelinear_rank": 32,
+                "quant_method": "litelinear",
+                "checkpoint_format": "factors",
+                "rank": 32,
             }
         )
 
-        self.assertFalse(config.load_dense_weight)
+        self.assertEqual(config.checkpoint_format, "factors")
         self.assertEqual(config.rank, 32)
 
     def test_default_policy_uses_shape_not_name(self):
@@ -283,7 +293,7 @@ class TestLiteLinearMethod(CustomTestCase):
             quant_config=LiteLinearConfig(
                 rank=2,
                 min_input_size=1,
-                load_dense_weight=False,
+                checkpoint_format="factors",
             ),
             prefix="model.layers.0.mlp.custom_expansion",
         )
@@ -330,7 +340,7 @@ class TestLiteLinearMethod(CustomTestCase):
         self.assertIsNone(layer.Q_scale_inv)
         self.assertTrue(FakeLiteLinear.instances[0].materialized)
 
-    def test_factor_checkpoint_path_requires_all_factors_without_dense_weight(self):
+    def test_factor_checkpoint_path_requires_all_factors(self):
         from sglang.srt.layers.linear import ReplicatedLinear
         from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
 
@@ -340,12 +350,12 @@ class TestLiteLinearMethod(CustomTestCase):
             quant_config=LiteLinearConfig(
                 rank=2,
                 min_input_size=1,
-                load_dense_weight=False,
+                checkpoint_format="factors",
             ),
             prefix="model.layers.0.mlp.custom_expansion",
         )
 
-        with self.assertRaisesRegex(RuntimeError, "factor tensors were not loaded"):
+        with self.assertRaisesRegex(RuntimeError, "offline factor checkpoint"):
             layer.quant_method.process_weights_after_loading(layer)
 
     def test_split_factor_checkpoint_raises_clear_error(self):
@@ -355,11 +365,15 @@ class TestLiteLinearMethod(CustomTestCase):
         layer = ReplicatedLinear(
             4,
             8,
-            quant_config=LiteLinearConfig(rank=2, min_input_size=1),
+            quant_config=LiteLinearConfig(
+                rank=2,
+                min_input_size=1,
+                checkpoint_format="factors",
+            ),
             prefix="model.layers.0.mlp.custom_expansion",
         )
 
-        with self.assertRaisesRegex(ValueError, "fused factor tensors"):
+        with self.assertRaisesRegex(ValueError, "fused factor"):
             layer.A.weight_loader(layer.A, torch.empty(8, 2), 0)
 
     def test_skip_bias_add_is_preserved(self):

@@ -11,6 +11,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+LTX2_LITELINEAR_DENSE_CONFIG_DIR = (
+    Path(__file__).resolve().parent / "litelinear_ltx2_dense_config"
+)
+
 
 @dataclass(frozen=True)
 class RunResult:
@@ -42,7 +46,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=768)
     parser.add_argument("--num-frames", type=int, default=25)
-    parser.add_argument("--num-inference-steps", type=int, default=4)
+    parser.add_argument("--num-inference-steps", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument(
@@ -144,7 +148,14 @@ def build_command(args, mode: str, perf_path: Path, output_path: Path) -> list[s
         ]
     )
     if mode == "litelinear":
-        cmd.extend(["--quantization", "litelinear"])
+        cmd.extend(
+            [
+                "--quantization",
+                "litelinear",
+                "--transformer-weights-path",
+                str(LTX2_LITELINEAR_DENSE_CONFIG_DIR),
+            ]
+        )
     cmd.extend(args.extra_arg)
     return cmd
 

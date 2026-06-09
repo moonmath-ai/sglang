@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 import torch
+from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
@@ -22,9 +23,8 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 class LiteLinearConfig(QuantizationConfig):
     """Optional LiteLinear integration for diffusion transformer FFN layers."""
 
-    DEFAULT_MIN_INPUT_SIZE = 4096
-    DEFAULT_MIN_OUTPUT_RATIO = 2.0
-    DEFAULT_MAX_OUTPUT_RATIO = 12.0
+    CHECKPOINT_FORMAT_DENSE = "dense"
+    CHECKPOINT_FORMAT_FACTORS = "factors"
 
     def __init__(
         self,
@@ -32,35 +32,22 @@ class LiteLinearConfig(QuantizationConfig):
         target_patterns: list[str] | str | None = None,
         ignored_layers: list[str] | str | None = None,
         packed_modules_mapping: dict[str, list[str]] | None = None,
-        min_input_size: int = DEFAULT_MIN_INPUT_SIZE,
-        min_output_ratio: float = DEFAULT_MIN_OUTPUT_RATIO,
-        max_output_ratio: float = DEFAULT_MAX_OUTPUT_RATIO,
+        checkpoint_format: str = CHECKPOINT_FORMAT_DENSE,
     ) -> None:
         super().__init__()
         if rank <= 0:
             raise ValueError(f"LiteLinear rank must be positive, got {rank}.")
-        if min_input_size <= 0:
-            raise ValueError(
-                f"LiteLinear min_input_size must be positive, got {min_input_size}."
-            )
-        if min_output_ratio <= 0:
-            raise ValueError(
-                "LiteLinear min_output_ratio must be positive, "
-                f"got {min_output_ratio}."
-            )
-        if max_output_ratio < min_output_ratio:
-            raise ValueError(
-                "LiteLinear max_output_ratio must be greater than or equal to "
-                f"min_output_ratio, got {max_output_ratio} < {min_output_ratio}."
-            )
 
         self.rank = rank
-        self.min_input_size = min_input_size
-        self.min_output_ratio = min_output_ratio
-        self.max_output_ratio = max_output_ratio
+        self.checkpoint_format = self._normalize_checkpoint_format(checkpoint_format)
         self.target_patterns = self._normalize_string_list(
             target_patterns, default=[]
         )
+        if not self.target_patterns:
+            raise ValueError(
+                "LiteLinear requires target_patterns regex entries. "
+                "Layer selection is name-based, not shape-based."
+            )
         self.ignored_layers = self._normalize_string_list(ignored_layers, default=[])
         self.packed_modules_mapping = packed_modules_mapping or {}
         self._compiled_target_patterns = [
@@ -96,26 +83,10 @@ class LiteLinearConfig(QuantizationConfig):
             packed_modules_mapping=cls.get_from_keys_or(
                 config, ["packed_modules_mapping"], {}
             ),
-            min_input_size=int(
-                cls.get_from_keys_or(
-                    config,
-                    ["min_input_size", "litelinear_min_input_size"],
-                    cls.DEFAULT_MIN_INPUT_SIZE,
-                )
-            ),
-            min_output_ratio=float(
-                cls.get_from_keys_or(
-                    config,
-                    ["min_output_ratio", "litelinear_min_output_ratio"],
-                    cls.DEFAULT_MIN_OUTPUT_RATIO,
-                )
-            ),
-            max_output_ratio=float(
-                cls.get_from_keys_or(
-                    config,
-                    ["max_output_ratio", "litelinear_max_output_ratio"],
-                    cls.DEFAULT_MAX_OUTPUT_RATIO,
-                )
+            checkpoint_format=cls.get_from_keys_or(
+                config,
+                ["checkpoint_format", "litelinear_checkpoint_format"],
+                cls.CHECKPOINT_FORMAT_DENSE,
             ),
         )
 
@@ -134,7 +105,7 @@ class LiteLinearConfig(QuantizationConfig):
         ):
             return UnquantizedLinearMethod()
 
-        if not self._is_allowed_by_name(prefix) or not self._is_supported_shape(layer):
+        if not self._is_allowed_by_name(prefix):
             return UnquantizedLinearMethod()
 
         return LiteLinearMethod(self, prefix)
@@ -143,22 +114,21 @@ class LiteLinearConfig(QuantizationConfig):
         return []
 
     def _is_allowed_by_name(self, prefix: str) -> bool:
-        if not self._compiled_target_patterns:
-            return True
         if not prefix:
             return False
         return any(pattern.search(prefix) for pattern in self._compiled_target_patterns)
 
-    def _is_supported_shape(self, layer: torch.nn.Module) -> bool:
-        input_size = int(getattr(layer, "input_size", 0))
-        output_size = int(getattr(layer, "output_size", 0))
-        if input_size <= 0 or output_size <= 0:
-            return False
-        if min(input_size, output_size) < self.min_input_size:
-            return False
-
-        feature_ratio = max(output_size / input_size, input_size / output_size)
-        return self.min_output_ratio <= feature_ratio <= self.max_output_ratio
+    @staticmethod
+    def _normalize_checkpoint_format(value: str) -> str:
+        value = str(value).strip().lower()
+        if value in ("", "dense", "none"):
+            return LiteLinearConfig.CHECKPOINT_FORMAT_DENSE
+        if value in ("factors", "factor"):
+            return LiteLinearConfig.CHECKPOINT_FORMAT_FACTORS
+        raise ValueError(
+            "LiteLinear checkpoint_format must be either 'dense' or "
+            f"'factors', got {value!r}."
+        )
 
     @staticmethod
     def _normalize_string_list(
@@ -173,6 +143,10 @@ class LiteLinearConfig(QuantizationConfig):
 
 
 class LiteLinearMethod(LinearMethodBase):
+    FACTOR_NAMES = ("A", "B", "Q_fp8", "Q_scale_inv")
+    _LOADED_FACTORS_ATTR = "_litelinear_loaded_factors"
+    _FACTOR_SHAPES_ATTR = "_litelinear_factor_shapes"
+
     def __init__(self, quant_config: LiteLinearConfig, prefix: str = "") -> None:
         self.quant_config = quant_config
         self.prefix = prefix
@@ -188,9 +162,36 @@ class LiteLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ) -> None:
         weight_loader = extra_weight_attrs.get("weight_loader")
+        output_size_per_partition = sum(output_partition_sizes)
+        if (
+            self.quant_config.checkpoint_format
+            == LiteLinearConfig.CHECKPOINT_FORMAT_FACTORS
+        ):
+            layer.register_parameter("weight", None)
+            self._register_factor_parameter(
+                layer,
+                "A",
+                (output_size_per_partition, self.quant_config.rank),
+                params_dtype,
+            )
+            self._register_factor_parameter(
+                layer,
+                "B",
+                (self.quant_config.rank, input_size_per_partition),
+                params_dtype,
+            )
+            self._register_factor_parameter(
+                layer,
+                "Q_fp8",
+                (output_size_per_partition, input_size_per_partition),
+                torch.float8_e4m3fn,
+            )
+            self._register_factor_parameter(layer, "Q_scale_inv", (), torch.float32)
+            return
+
         weight = ModelWeightParameter(
             data=torch.empty(
-                sum(output_partition_sizes),
+                output_size_per_partition,
                 input_size_per_partition,
                 dtype=params_dtype,
             ),
@@ -202,6 +203,13 @@ class LiteLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_lite_linear_module", None) is not None:
+            return
+
+        if (
+            self.quant_config.checkpoint_format
+            == LiteLinearConfig.CHECKPOINT_FORMAT_FACTORS
+        ):
+            self._process_loaded_factors(layer)
             return
 
         LiteLinear = _load_litelinear_class()
@@ -254,6 +262,62 @@ class LiteLinearMethod(LinearMethodBase):
             output = output + bias
         return output
 
+    def _init_factor_loading_state(
+        self, layer: torch.nn.Module, name: str, shape: tuple[int, ...]
+    ) -> None:
+        if not hasattr(layer, self._LOADED_FACTORS_ATTR):
+            object.__setattr__(layer, self._LOADED_FACTORS_ATTR, set())
+            object.__setattr__(layer, self._FACTOR_SHAPES_ATTR, {})
+        getattr(layer, self._FACTOR_SHAPES_ATTR)[name] = shape
+
+    def _register_factor_parameter(
+        self,
+        layer: torch.nn.Module,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> None:
+        self._init_factor_loading_state(layer, name, shape)
+        param = Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+        setattr(param, "weight_loader", _make_factor_weight_loader(name, layer))
+        layer.register_parameter(name, param)
+
+    def _process_loaded_factors(self, layer: torch.nn.Module) -> None:
+        loaded_factors = getattr(layer, self._LOADED_FACTORS_ATTR, set())
+        missing = [name for name in self.FACTOR_NAMES if name not in loaded_factors]
+        if missing:
+            input_size = getattr(layer, "input_size", None)
+            output_size = getattr(layer, "output_size", None)
+            raise RuntimeError(
+                f"LiteLinear layer {self.prefix or '<unnamed>'} expects an "
+                "offline factor checkpoint but did not load "
+                f"(input_size={input_size}, output_size={output_size}): "
+                f"{', '.join(missing)}."
+            )
+
+        LiteLinear = _load_litelinear_class()
+        A = layer.A
+        B = layer.B
+        lite_layer = _make_lite_linear(
+            LiteLinear,
+            in_features=B.shape[1],
+            out_features=A.shape[0],
+            rank=B.shape[0],
+            device=A.device,
+            dtype=A.dtype,
+        )
+        state_dict = {name: getattr(layer, name).detach() for name in self.FACTOR_NAMES}
+        lite_layer.load_state_dict(state_dict, strict=True)
+        lite_layer.eval()
+
+        if self.prefix:
+            setattr(lite_layer, "_lite_key", self.prefix)
+
+        layer.register_parameter("weight", None)
+        for name in self.FACTOR_NAMES:
+            layer.register_parameter(name, None)
+        object.__setattr__(layer, "_lite_linear_module", lite_layer)
+
 
 def _load_litelinear_class():
     try:
@@ -271,6 +335,40 @@ def _load_litelinear_class():
         raise ImportError(
             "The `lite_linear` package does not export LiteLinear."
         ) from exc
+
+
+def _make_factor_weight_loader(factor_name: str, layer: torch.nn.Module):
+    def factor_weight_loader(
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        shard_id: int | str | None = None,
+    ) -> None:
+        if shard_id is not None:
+            raise ValueError(
+                "LiteLinear offline factor checkpoints must store fused factor "
+                f"tensors directly on the LiteLinear module. Got shard_id={shard_id!r} "
+                f"while loading factor {factor_name}."
+            )
+
+        factor_shapes = getattr(layer, LiteLinearMethod._FACTOR_SHAPES_ATTR, {})
+        expected_shape = factor_shapes.get(factor_name)
+        if expected_shape is not None and tuple(loaded_weight.shape) != expected_shape:
+            raise ValueError(
+                f"Attempted to load LiteLinear factor {factor_name} with shape "
+                f"{loaded_weight.size()} into expected shape {expected_shape}."
+            )
+
+        if param.numel() == 1 and loaded_weight.numel() == 1:
+            param.data.fill_(loaded_weight.item())
+        else:
+            assert param.size() == loaded_weight.size(), (
+                f"Attempted to load LiteLinear factor {factor_name} with shape "
+                f"{loaded_weight.size()} into parameter {param.size()}"
+            )
+            param.data.copy_(loaded_weight)
+        getattr(layer, LiteLinearMethod._LOADED_FACTORS_ATTR).add(factor_name)
+
+    return factor_weight_loader
 
 
 def _make_lite_linear(

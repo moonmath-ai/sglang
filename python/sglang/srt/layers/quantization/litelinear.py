@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import inspect
 import re
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -30,17 +29,9 @@ class LiteLinearConfig(QuantizationConfig):
     DEFAULT_MIN_INPUT_SIZE = 4096
     DEFAULT_MIN_OUTPUT_RATIO = 2.0
     DEFAULT_MAX_OUTPUT_RATIO = 12.0
-    MODEL_LOADER_EXTRA_CONFIG_KEYS = [
-        "litelinear_checkpoint_mode",
-        "litelinear_online_patch",
-        "litelinear_strict_patch",
-        "litelinear_patch_cache_root",
-        "litelinear_patch_config_path",
-        "litelinear_patch_tag",
-        "litelinear_patch_copy_original",
-        "litelinear_patch_force_rebuild",
-        "litelinear_rank",
-    ]
+    MODEL_LOADER_EXTRA_CONFIG_KEYS = ["litelinear_checkpoint_format"]
+    CHECKPOINT_FORMAT_DENSE = "dense"
+    CHECKPOINT_FORMAT_FACTORS = "factors"
 
     def __init__(
         self,
@@ -51,7 +42,7 @@ class LiteLinearConfig(QuantizationConfig):
         min_input_size: int = DEFAULT_MIN_INPUT_SIZE,
         min_output_ratio: float = DEFAULT_MIN_OUTPUT_RATIO,
         max_output_ratio: float = DEFAULT_MAX_OUTPUT_RATIO,
-        load_dense_weight: bool = True,
+        checkpoint_format: str = CHECKPOINT_FORMAT_DENSE,
     ) -> None:
         super().__init__()
         if rank <= 0:
@@ -72,7 +63,7 @@ class LiteLinearConfig(QuantizationConfig):
             )
 
         self.rank = rank
-        self.load_dense_weight = load_dense_weight
+        self.checkpoint_format = self._normalize_checkpoint_format(checkpoint_format)
         self.min_input_size = min_input_size
         self.min_output_ratio = min_output_ratio
         self.max_output_ratio = max_output_ratio
@@ -137,12 +128,10 @@ class LiteLinearConfig(QuantizationConfig):
                     cls.DEFAULT_MAX_OUTPUT_RATIO,
                 )
             ),
-            load_dense_weight=bool(
-                cls.get_from_keys_or(
-                    config,
-                    ["load_dense_weight", "litelinear_load_dense_weight"],
-                    True,
-                )
+            checkpoint_format=cls.get_from_keys_or(
+                config,
+                ["checkpoint_format", "litelinear_checkpoint_format"],
+                cls.CHECKPOINT_FORMAT_DENSE,
             ),
         )
 
@@ -153,22 +142,13 @@ class LiteLinearConfig(QuantizationConfig):
     def update_from_model_loader_extra_config(
         self, model_loader_extra_config: Dict[str, Any]
     ) -> None:
-        checkpoint_mode = _get_checkpoint_mode(model_loader_extra_config)
-        if checkpoint_mode in ("online_patch", "strict"):
-            self.load_dense_weight = False
-            if "litelinear_rank" in model_loader_extra_config:
-                self.rank = int(model_loader_extra_config["litelinear_rank"])
-
-    @classmethod
-    def maybe_process_safetensors_files(
-        cls,
-        hf_weights_files: List[str],
-        model_loader_extra_config: Dict[str, Any],
-    ) -> List[str]:
-        return maybe_resolve_litelinear_patched_weights(
-            hf_weights_files,
-            model_loader_extra_config,
+        checkpoint_format = model_loader_extra_config.get(
+            "litelinear_checkpoint_format"
         )
+        if checkpoint_format is not None:
+            self.checkpoint_format = self._normalize_checkpoint_format(
+                checkpoint_format
+            )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -214,6 +194,18 @@ class LiteLinearConfig(QuantizationConfig):
         return self.min_output_ratio <= feature_ratio <= self.max_output_ratio
 
     @staticmethod
+    def _normalize_checkpoint_format(value: str) -> str:
+        value = str(value).strip().lower()
+        if value in ("", "dense", "none"):
+            return LiteLinearConfig.CHECKPOINT_FORMAT_DENSE
+        if value in ("factors", "factor"):
+            return LiteLinearConfig.CHECKPOINT_FORMAT_FACTORS
+        raise ValueError(
+            "LiteLinear checkpoint_format must be either 'dense' or "
+            f"'factors', got {value!r}."
+        )
+
+    @staticmethod
     def _normalize_string_list(
         value: Optional[str | List[str]],
         default: List[str],
@@ -243,60 +235,56 @@ class LiteLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        if self.quant_config.load_dense_weight:
-            weight = Parameter(
-                torch.empty(
-                    output_size_per_partition,
-                    input_size_per_partition,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
-            )
-            set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-            layer.register_parameter("weight", weight)
-            set_weight_attrs(weight, extra_weight_attrs)
-        else:
+        if (
+            self.quant_config.checkpoint_format
+            == LiteLinearConfig.CHECKPOINT_FORMAT_FACTORS
+        ):
             layer.register_parameter("weight", None)
+            self._register_lazy_factor_parameter(
+                layer,
+                "A",
+                (output_size_per_partition, self.quant_config.rank),
+                params_dtype,
+            )
+            self._register_lazy_factor_parameter(
+                layer,
+                "B",
+                (self.quant_config.rank, input_size_per_partition),
+                params_dtype,
+            )
+            self._register_lazy_factor_parameter(
+                layer,
+                "Q_fp8",
+                (output_size_per_partition, input_size_per_partition),
+                torch.float8_e4m3fn,
+            )
+            self._register_lazy_factor_parameter(
+                layer, "Q_scale_inv", (), torch.float32
+            )
+            return
 
-        self._register_lazy_factor_parameter(
-            layer,
-            "A",
-            (output_size_per_partition, self.quant_config.rank),
-            params_dtype,
+        weight = Parameter(
+            torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
         )
-        self._register_lazy_factor_parameter(
-            layer,
-            "B",
-            (self.quant_config.rank, input_size_per_partition),
-            params_dtype,
-        )
-        self._register_lazy_factor_parameter(
-            layer,
-            "Q_fp8",
-            (output_size_per_partition, input_size_per_partition),
-            torch.float8_e4m3fn,
-        )
-        self._register_lazy_factor_parameter(layer, "Q_scale_inv", (), torch.float32)
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_lite_linear_module", None) is not None:
             return
 
-        if self._has_loaded_factors(layer):
+        if (
+            self.quant_config.checkpoint_format
+            == LiteLinearConfig.CHECKPOINT_FORMAT_FACTORS
+        ):
             self._process_loaded_factors(layer)
             return
-
-        if layer.weight is None:
-            missing = ", ".join(
-                name
-                for name in self.FACTOR_NAMES
-                if not getattr(getattr(layer, name, None), "_litelinear_loaded", False)
-            )
-            raise RuntimeError(
-                f"LiteLinear layer {self.prefix or '<unnamed>'} was configured "
-                "without dense weight fallback, but factor tensors were not "
-                f"loaded. Missing: {missing}."
-            )
 
         LiteLinear = _load_litelinear_class()
         weight = layer.weight
@@ -326,7 +314,6 @@ class LiteLinearMethod(LinearMethodBase):
         materialize_from_weight()
         lite_layer.eval()
         layer.register_parameter("weight", None)
-        self._clear_factor_parameters(layer)
 
         # Avoid registering this temporary wrapper as a child module while
         # model.named_modules() is iterating during post-load processing.
@@ -364,13 +351,19 @@ class LiteLinearMethod(LinearMethodBase):
         setattr(param, "weight_loader", _make_factor_weight_loader(name))
         layer.register_parameter(name, param)
 
-    def _has_loaded_factors(self, layer: torch.nn.Module) -> bool:
-        return all(
-            getattr(getattr(layer, name, None), "_litelinear_loaded", False)
-            for name in self.FACTOR_NAMES
-        )
-
     def _process_loaded_factors(self, layer: torch.nn.Module) -> None:
+        missing = [
+            name
+            for name in self.FACTOR_NAMES
+            if not getattr(getattr(layer, name, None), "_litelinear_loaded", False)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"LiteLinear layer {self.prefix or '<unnamed>'} expects an "
+                "offline factor checkpoint but did not load: "
+                f"{', '.join(missing)}."
+            )
+
         LiteLinear = _load_litelinear_class()
         A = layer.A
         B = layer.B
@@ -390,12 +383,9 @@ class LiteLinearMethod(LinearMethodBase):
             setattr(lite_layer, "_lite_key", self.prefix)
 
         layer.register_parameter("weight", None)
-        self._clear_factor_parameters(layer)
-        object.__setattr__(layer, "_lite_linear_module", lite_layer)
-
-    def _clear_factor_parameters(self, layer: torch.nn.Module) -> None:
         for name in self.FACTOR_NAMES:
             layer.register_parameter(name, None)
+        object.__setattr__(layer, "_lite_linear_module", lite_layer)
 
 
 def _load_litelinear_class():
@@ -424,10 +414,11 @@ def _make_factor_weight_loader(factor_name: str):
     ) -> None:
         if shard_id is not None:
             raise ValueError(
-                "LiteLinear factor checkpoints must store fused factor tensors "
-                f"directly on the LiteLinear module. Got shard_id={shard_id!r} "
+                "LiteLinear offline factor checkpoints must store fused factor "
+                f"tensors directly on the LiteLinear module. Got shard_id={shard_id!r} "
                 f"while loading factor {factor_name}."
             )
+
         expected_shape = getattr(param, "_litelinear_expected_shape", None)
         expected_dtype = getattr(param, "_litelinear_expected_dtype", None)
         if expected_shape is not None and tuple(loaded_weight.shape) != expected_shape:
@@ -435,10 +426,11 @@ def _make_factor_weight_loader(factor_name: str):
                 f"Attempted to load LiteLinear factor {factor_name} with shape "
                 f"{loaded_weight.size()} into expected shape {expected_shape}."
             )
+
         if isinstance(param, UninitializedParameter):
             param.materialize(
                 tuple(loaded_weight.shape),
-                device=param.device,
+                device=loaded_weight.device,
                 dtype=expected_dtype or loaded_weight.dtype,
             )
         if param.numel() == 1 and loaded_weight.numel() == 1:
@@ -452,99 +444,6 @@ def _make_factor_weight_loader(factor_name: str):
         setattr(param, "_litelinear_loaded", True)
 
     return factor_weight_loader
-
-
-def maybe_resolve_litelinear_patched_weights(
-    hf_weights_files: List[str],
-    model_loader_extra_config: Dict[str, Any],
-) -> List[str]:
-    checkpoint_mode = _get_checkpoint_mode(model_loader_extra_config)
-    if checkpoint_mode in ("", "dense", "none"):
-        return hf_weights_files
-    if checkpoint_mode not in ("online_patch", "strict"):
-        raise ValueError(
-            "litelinear_checkpoint_mode must be one of 'dense', "
-            f"'online_patch', or 'strict', got {checkpoint_mode!r}."
-        )
-
-    try:
-        from lite_linear.checkpoint_patch_core import (
-            count_patchable_pairs_for_checkpoint,
-            default_cache_root,
-            resolve_or_build_patched_checkpoint,
-            resolve_strict_checkpoint_path,
-        )
-        from lite_linear.patched_checkpoint import get_safe_open_for_patch_build
-    except ImportError as exc:
-        raise ImportError(
-            "LiteLinear checkpoint patching requires a lite_linear package "
-            "with checkpoint_patch_core support."
-        ) from exc
-
-    safe_open_fn = get_safe_open_for_patch_build()
-    cache_root = Path(
-        model_loader_extra_config.get("litelinear_patch_cache_root")
-        or default_cache_root()
-    )
-    patch_config_path = model_loader_extra_config.get("litelinear_patch_config_path")
-    patch_config_path = Path(patch_config_path) if patch_config_path else None
-    rank = int(model_loader_extra_config.get("litelinear_rank", 64))
-    tag = str(model_loader_extra_config.get("litelinear_patch_tag", "nocalib"))
-    copy_original = bool(
-        model_loader_extra_config.get("litelinear_patch_copy_original", True)
-    )
-    force_rebuild = bool(
-        model_loader_extra_config.get("litelinear_patch_force_rebuild", False)
-    )
-
-    resolved_files: List[str] = []
-    for file_name in hf_weights_files:
-        src_path = Path(file_name)
-        patchable_count = count_patchable_pairs_for_checkpoint(
-            src_path,
-            safe_open_fn=safe_open_fn,
-            patch_config_path=patch_config_path,
-        )
-        if patchable_count == 0:
-            resolved_files.append(file_name)
-            continue
-
-        if checkpoint_mode == "online_patch":
-            resolved_path = resolve_or_build_patched_checkpoint(
-                src_path,
-                rank=rank,
-                tag=tag,
-                cache_root=cache_root,
-                copy_original=copy_original,
-                force_rebuild=force_rebuild,
-                safe_open_fn=safe_open_fn,
-                log_prefix="[SGLang LiteLinear]",
-                patch_config_path=patch_config_path,
-            )
-        else:
-            resolved_path = resolve_strict_checkpoint_path(
-                src_path,
-                rank=rank,
-                tag=tag,
-                cache_root=cache_root,
-                safe_open_fn=safe_open_fn,
-                log_prefix="[SGLang LiteLinear]",
-                patch_config_path=patch_config_path,
-            )
-        resolved_files.append(str(resolved_path))
-
-    return resolved_files
-
-
-def _get_checkpoint_mode(model_loader_extra_config: Dict[str, Any]) -> str:
-    checkpoint_mode = str(
-        model_loader_extra_config.get("litelinear_checkpoint_mode", "dense")
-    ).strip()
-    if model_loader_extra_config.get("litelinear_online_patch", False):
-        checkpoint_mode = "online_patch"
-    if model_loader_extra_config.get("litelinear_strict_patch", False):
-        checkpoint_mode = "strict"
-    return checkpoint_mode
 
 
 def _make_lite_linear(

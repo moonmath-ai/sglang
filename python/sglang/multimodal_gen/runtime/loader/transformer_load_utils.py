@@ -283,6 +283,14 @@ def resolve_transformer_safetensors_to_load(
             safetensors_list = [quantized_path]
         else:
             safetensors_list = _list_safetensors_files(quantized_path)
+            if not safetensors_list:
+                logger.info(
+                    "No safetensors in transformer_weights_path=%s; loading "
+                    "transformer weights from component path %s",
+                    quantized_path,
+                    component_model_path,
+                )
+                safetensors_list = _list_safetensors_files(component_model_path)
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
@@ -506,6 +514,27 @@ def _resolve_quant_config(
         # the component directory rather than constructing an empty config.
         if server_args.quantization == "modelslim":
             return get_quant_config(hf_config, component_model_path)
+        if server_args.quantization == "litelinear":
+            quant_config = get_quant_config(hf_config, component_model_path)
+            if _get_quant_config_name(quant_config) == "litelinear":
+                return quant_config
+            if server_args.transformer_weights_path:
+                override_config = _resolve_quant_config_from_transformer_override(
+                    server_args.transformer_weights_path
+                )
+                if _get_quant_config_name(override_config) == "litelinear":
+                    return override_config
+                for safetensors_file in safetensors_list:
+                    quant_config = get_quant_config_from_safetensors_metadata(
+                        safetensors_file
+                    )
+                    if _get_quant_config_name(quant_config) == "litelinear":
+                        return quant_config
+
+            raise ValueError(
+                "LiteLinear requires quantization_config with target_patterns in "
+                "config.json on the model path or --transformer-weights-path."
+            )
 
         # Online-quant convention: for `fp8` and `mxfp4`, a no-arg
         # QuantizationConfig() selects the post-load path -- weights load
