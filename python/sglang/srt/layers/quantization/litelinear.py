@@ -411,7 +411,9 @@ def _load_litelinear_class():
     try:
         return module.LiteLinear
     except AttributeError as exc:
-        raise ImportError("The `lite_linear` package does not export LiteLinear.") from exc
+        raise ImportError(
+            "The `lite_linear` package does not export LiteLinear."
+        ) from exc
 
 
 def _make_factor_weight_loader(factor_name: str):

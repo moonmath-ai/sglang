@@ -8,9 +8,12 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,27 @@ def parse_args():
             "or missing dependencies may fail."
         ),
     )
+    parser.add_argument(
+        "--quality-eval",
+        choices=["none", "gsm8k"],
+        default="none",
+        help="Run an optional SGLang quality eval after speed benchmarks.",
+    )
+    parser.add_argument(
+        "--quality-load-format",
+        default="auto",
+        help=(
+            "Load format for quality eval servers. Use real weights for useful "
+            "quality numbers."
+        ),
+    )
+    parser.add_argument("--quality-host", default="127.0.0.1")
+    parser.add_argument("--quality-port", type=int, default=30000)
+    parser.add_argument("--quality-timeout", type=int, default=900)
+    parser.add_argument("--quality-num-examples", type=int, default=32)
+    parser.add_argument("--quality-num-threads", type=int, default=32)
+    parser.add_argument("--quality-num-shots", type=int, default=5)
+    parser.add_argument("--quality-max-tokens", type=int, default=512)
     return parser.parse_args()
 
 
@@ -183,6 +207,111 @@ def run_command(cmd: list[str], env: dict[str, str]) -> None:
         raise subprocess.CalledProcessError(ret, cmd)
 
 
+def build_server_command(args, mode: str, port: int) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        args.model_path,
+        "--load-format",
+        args.quality_load_format,
+        "--dtype",
+        args.dtype,
+        "--host",
+        args.quality_host,
+        "--port",
+        str(port),
+        "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
+    ]
+    quantization = mode_to_quantization(mode)
+    if quantization is not None:
+        cmd.extend(["--quantization", quantization])
+    if args.trust_remote_code:
+        cmd.append("--trust-remote-code")
+    return cmd
+
+
+def wait_for_server(base_url: str, timeout_s: int) -> None:
+    deadline = time.time() + timeout_s
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with urlopen(f"{base_url}/health", timeout=5) as response:
+                if 200 <= response.status < 300:
+                    return
+        except (OSError, URLError) as exc:
+            last_error = exc
+        time.sleep(2)
+    raise TimeoutError(f"Server at {base_url} did not become healthy: {last_error}")
+
+
+def stop_server(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def run_gsm8k_quality(
+    args, mode: str, env: dict[str, str], result_file: Path, port: int
+) -> dict:
+    base_url = f"http://{args.quality_host}:{port}"
+    server_cmd = build_server_command(args, mode, port)
+    eval_code = f"""
+import json
+from types import SimpleNamespace
+from sglang.test.run_eval import run_eval
+args = SimpleNamespace(
+    base_url={base_url!r},
+    host={args.quality_host!r},
+    port={port},
+    model={args.model_path!r},
+    eval_name="gsm8k",
+    api="completion",
+    max_tokens={args.quality_max_tokens},
+    temperature=0.0,
+    top_p=1.0,
+    num_examples={args.quality_num_examples},
+    num_threads={args.quality_num_threads},
+    num_shots={args.quality_num_shots},
+    repeat=1,
+)
+metrics = run_eval(args)
+with open({str(result_file)!r}, "w", encoding="utf-8") as f:
+    json.dump(metrics, f, indent=2)
+print(json.dumps(metrics, sort_keys=True))
+"""
+    eval_cmd = [sys.executable, "-c", eval_code]
+
+    print("\n$ " + " ".join(server_cmd), flush=True)
+    server_log_file = result_file.with_suffix(".server.log")
+    server_log = server_log_file.open("w", encoding="utf-8")
+    server_proc = subprocess.Popen(
+        server_cmd,
+        env=env,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        wait_for_server(base_url, args.quality_timeout)
+        run_command(eval_cmd, env)
+    finally:
+        stop_server(server_proc)
+        server_log.close()
+        print(f"Server log: {server_log_file}")
+
+    with result_file.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_last_result(path: Path) -> dict:
     rows = []
     with path.open("r", encoding="utf-8") as f:
@@ -201,11 +330,16 @@ def fmt_float(value: float | None, suffix: str = "") -> str:
     return f"{value:,.2f}{suffix}"
 
 
-def pct(new: float, old: float) -> float:
+def pct(new: float | None, old: float | None) -> float | None:
+    if new is None or old is None or old == 0:
+        return None
     return (new / old - 1.0) * 100.0
 
 
-def print_summary(rows: Iterable[tuple[DemoCase, dict[str, dict]]], modes: list[str]) -> None:
+def print_summary(
+    rows: Iterable[tuple[DemoCase, dict[str, dict]]],
+    modes: list[str],
+) -> None:
     print("\nLiteLinear Demo Summary")
     print(
         "| Case | Metric | Mode | Default | Mode value | Change |\n"
@@ -241,6 +375,37 @@ def print_summary(rows: Iterable[tuple[DemoCase, dict[str, dict]]], modes: list[
                 f"| {case.name} | overall tok/s | `{mode}` | "
                 f"{fmt_float(default_total)} | {fmt_float(mode_total)} | "
                 f"{fmt_float(pct(mode_total, default_total), '%')} |"
+            )
+
+
+def print_quality_summary(results: dict[str, dict], modes: list[str]) -> None:
+    if not results:
+        return
+
+    print("\nLiteLinear Quality Summary")
+    print(
+        "| Eval | Metric | Mode | Default | Mode value | Change |\n"
+        "| --- | --- | --- | ---: | ---: | ---: |"
+    )
+    default = results["default"]
+    default_score = default.get("score")
+    default_latency = default.get("latency")
+    for mode in modes:
+        if mode == "default":
+            continue
+        mode_result = results[mode]
+        mode_score = mode_result.get("score")
+        score_change = pct(mode_score, default_score)
+        print(
+            f"| gsm8k | score | `{mode}` | {fmt_float(default_score)} | "
+            f"{fmt_float(mode_score)} | {fmt_float(score_change, '%')} |"
+        )
+        mode_latency = mode_result.get("latency")
+        if default_latency is not None and mode_latency is not None:
+            latency_change = pct(mode_latency, default_latency)
+            print(
+                f"| gsm8k | latency s | `{mode}` | {fmt_float(default_latency)} | "
+                f"{fmt_float(mode_latency)} | {fmt_float(latency_change, '%')} |"
             )
 
 
@@ -281,6 +446,24 @@ def main():
 
     if summary_rows:
         print_summary(summary_rows, modes)
+
+    if args.quality_eval == "gsm8k":
+        quality_results = {}
+        for i, mode in enumerate(modes):
+            quality_file = result_dir / f"{safe_mode_name(mode)}_gsm8k_quality.json"
+            quality_file.unlink(missing_ok=True)
+            quality_port = args.quality_port + i
+            if args.dry_run:
+                print(" ".join(build_server_command(args, mode, quality_port)))
+                continue
+            quality_results[mode] = run_gsm8k_quality(
+                args,
+                mode,
+                env,
+                quality_file,
+                quality_port,
+            )
+        print_quality_summary(quality_results, modes)
 
 
 if __name__ == "__main__":

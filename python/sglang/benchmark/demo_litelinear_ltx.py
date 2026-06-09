@@ -45,7 +45,6 @@ def parse_args():
     parser.add_argument("--num-inference-steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-gpus", type=int, default=1)
-    parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument(
         "--result-dir",
         default="/tmp/sglang_litelinear_ltx_demo",
@@ -119,31 +118,29 @@ def build_command(args, mode: str, perf_path: Path, output_path: Path) -> list[s
     )
     cmd.extend(
         [
-        "generate",
-        "--model-path",
-        args.model_path,
-        "--pipeline-class-name",
-        args.pipeline_class_name,
-        "--prompt",
-        args.prompt,
-        "--height",
-        str(args.height),
-        "--width",
-        str(args.width),
-        "--num-frames",
-        str(args.num_frames),
-        "--num-inference-steps",
-        str(args.num_inference_steps),
-        "--seed",
-        str(args.seed),
-        "--num-gpus",
-        str(args.num_gpus),
-        "--dtype",
-        args.dtype,
-        "--perf-dump-path",
-        str(perf_path),
-        "--output-file-path",
-        str(output_path),
+            "generate",
+            "--model-path",
+            args.model_path,
+            "--pipeline-class-name",
+            args.pipeline_class_name,
+            "--prompt",
+            args.prompt,
+            "--height",
+            str(args.height),
+            "--width",
+            str(args.width),
+            "--num-frames",
+            str(args.num_frames),
+            "--num-inference-steps",
+            str(args.num_inference_steps),
+            "--seed",
+            str(args.seed),
+            "--num-gpus",
+            str(args.num_gpus),
+            "--perf-dump-path",
+            str(perf_path),
+            "--output-file-path",
+            str(output_path),
         ]
     )
     if mode == "litelinear":
@@ -174,21 +171,29 @@ def read_perf(path: Path) -> tuple[float | None, float | None, float | None]:
 def run_mode(args, mode: str, result_dir: Path, env: dict[str, str]) -> RunResult:
     perf_path = result_dir / f"{safe_name(mode)}.perf.json"
     output_path = result_dir / f"{safe_name(mode)}.mp4"
+    log_path = result_dir / f"{safe_name(mode)}.log"
     cmd = build_command(args, mode, perf_path, output_path)
     print("\n$ " + " ".join(cmd), flush=True)
     if args.dry_run:
         return RunResult(mode, None, None, None, perf_path, ok=True)
 
-    completed = subprocess.run(
-        cmd,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    print(completed.stdout, end="")
-    if completed.returncode != 0:
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            log_file.write(line)
+            log_file.flush()
+        returncode = process.wait()
+
+    if returncode != 0:
         return RunResult(
             mode,
             None,
@@ -196,7 +201,18 @@ def run_mode(args, mode: str, result_dir: Path, env: dict[str, str]) -> RunResul
             None,
             perf_path,
             ok=False,
-            error=f"exit code {completed.returncode}",
+            error=f"exit code {returncode}",
+        )
+
+    if not perf_path.exists():
+        return RunResult(
+            mode,
+            None,
+            None,
+            None,
+            perf_path,
+            ok=False,
+            error=f"missing perf dump: {perf_path}",
         )
 
     total_duration_ms, denoise_ms, peak_reserved_mb = read_perf(perf_path)
@@ -229,7 +245,8 @@ def print_table(results: list[RunResult]):
 
     print("\nLTX LiteLinear Demo Summary")
     print(
-        "| Mode | OK | total ms | denoise ms | peak reserved MB | total change | denoise change |"
+        "| Mode | OK | total ms | denoise ms | peak reserved MB | "
+        "total change | denoise change |"
     )
     print("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
     for result in results:
