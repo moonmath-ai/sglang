@@ -159,6 +159,9 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
     cfg_parallel_degree: Optional[int] = None
+    # Batched CFG: run cond+uncond branches as one concatenated batch-2 forward
+    # on a single GPU. Opt-in; mutually exclusive with cfg parallel.
+    enable_batched_cfg: bool = False
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -1177,6 +1180,17 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set. Use false to disable it explicitly.",
         )
         parser.add_argument(
+            "--enable-batched-cfg",
+            action=StoreBoolean,
+            default=ServerArgs.enable_batched_cfg,
+            help=(
+                "Run the cond+uncond CFG branches as a single concatenated batch-2 "
+                "forward on one GPU instead of two sequential forwards. Cuts per-step "
+                "launch overhead at batch 1. Mutually exclusive with CFG parallel; "
+                "auto-disabled with TeaCache or STA/VSA (CFG-separated state)."
+            ),
+        )
+        parser.add_argument(
             "--cfg-parallel-size",
             dest="cfg_parallel_degree",
             type=int,
@@ -1981,6 +1995,14 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
+        if self.enable_batched_cfg and self.enable_cfg_parallel:
+            # Cross-GPU CFG already runs each branch on its own rank; fusing the
+            # two branches into one batch-2 forward is the single-GPU alternative.
+            logger.warning(
+                "--enable-batched-cfg is ignored because CFG parallel is enabled "
+                "(the branches already run on separate ranks)."
+            )
+            self.enable_batched_cfg = False
 
     def _validate_batching(self):
         if self.batching_mode != "dynamic":

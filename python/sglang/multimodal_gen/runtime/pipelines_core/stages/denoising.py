@@ -1591,6 +1591,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
             # perform cfg branches in parallel, following the cfg policy
             predictions = run_cfg_parallel(cfg_policy, predict_fn)
+        elif self._can_use_batched_cfg(batch, server_args, cfg_policy):
+            # Single-GPU: fuse the cond+uncond branches into one batch-2 forward.
+            predictions = self._predict_noise_batched(
+                cfg_policy=cfg_policy,
+                current_model=current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=timestep_index,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                guidance=guidance,
+                latents=latents,
+                server_args=server_args,
+            )
+            if predictions is None:
+                # Branches couldn't be safely concatenated -> sequential fallback.
+                predictions = [predict_fn(branch) for branch in cfg_policy.branches]
         else:
             # perform cfg branches one-by-one locally
             predictions = [predict_fn(branch) for branch in cfg_policy.branches]
@@ -1602,6 +1620,142 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             server_args.pipeline_config,
             cfg_parallel=server_args.enable_cfg_parallel,
         )
+
+    def _can_use_batched_cfg(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        cfg_policy: CFGPolicy,
+    ) -> bool:
+        """Whether the cond+uncond branches may be fused into one forward.
+
+        Batched CFG is opt-in and single-GPU only. It is disabled whenever the
+        run keeps CFG-branch-separated state that a fused forward cannot key on:
+        TeaCache (per-branch residual caches, and its batch-size-1 squeeze) and
+        the STA/VSA backends (per-branch attention masks), both selected via
+        ``batch.is_cfg_negative``.
+        """
+        if not server_args.enable_batched_cfg:
+            return False
+        if server_args.enable_cfg_parallel:
+            return False
+        if len(cfg_policy.branches) != 2:
+            return False
+        if not cfg_policy.supports_batched_cfg():
+            return False
+        if getattr(batch, "enable_teacache", False):
+            return False
+        if self.attn_backend is not None and self.attn_backend.get_enum() in (
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+        ):
+            return False
+        return True
+
+    def _predict_noise_batched(
+        self,
+        *,
+        cfg_policy: CFGPolicy,
+        current_model: nn.Module,
+        latent_model_input: torch.Tensor,
+        timestep,
+        batch: Req,
+        timestep_index: int,
+        attn_metadata,
+        target_dtype,
+        guidance: torch.Tensor,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+    ) -> "list[torch.Tensor | tuple[torch.Tensor, ...]] | None":
+        """Run all CFG branches as one batch-concatenated forward.
+
+        Returns predictions in branch order (matching the sequential path so
+        ``cfg_policy.combine`` is unchanged), or ``None`` when the branches
+        cannot be concatenated and the caller should fall back to sequential
+        per-branch forwards.
+        """
+        merged_kwargs = cfg_policy.batched_branch_kwargs()
+        if merged_kwargs is None:
+            logger.warning_once(
+                "Batched CFG requested but branches cannot be concatenated "
+                "(mismatched kwargs); falling back to sequential per-branch CFG."
+            )
+            return None
+
+        logger.info_once(
+            f"Batched CFG active: fusing {len(cfg_policy.branches)} "
+            "branches into one forward."
+        )
+
+        n_branches = len(cfg_policy.branches)
+        base_bs = latent_model_input.shape[0]
+        batched_latent = torch.cat([latent_model_input] * n_branches, dim=0)
+        batched_timestep = self._expand_along_batched_cfg(
+            timestep, base_bs, n_branches
+        )
+        batched_guidance = self._expand_along_batched_cfg(
+            guidance, base_bs, n_branches
+        )
+
+        with set_forward_context(
+            current_timestep=timestep_index,
+            attn_metadata=attn_metadata,
+            forward_batch=batch,
+        ):
+            raw = self._predict_noise(
+                current_model=current_model,
+                latent_model_input=batched_latent,
+                timestep=batched_timestep,
+                target_dtype=target_dtype,
+                guidance=batched_guidance,
+                **merged_kwargs,
+            )
+
+        return self._split_batched_prediction(
+            raw, n_branches, base_bs, latents, server_args
+        )
+
+    @staticmethod
+    def _expand_along_batched_cfg(value, base_bs: int, n_branches: int):
+        """Repeat a per-batch tensor (timestep, guidance) to match fused latents.
+
+        Only tensors whose leading dim equals the per-branch batch size are
+        repeated; scalars, ``None``, and already-broadcastable tensors are passed
+        through unchanged (the model broadcasts them across the fused batch).
+        """
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim >= 1
+            and value.shape[0] == base_bs
+        ):
+            return torch.cat([value] * n_branches, dim=0)
+        return value
+
+    def _split_batched_prediction(
+        self,
+        raw: "torch.Tensor | tuple[torch.Tensor, ...]",
+        n_branches: int,
+        base_bs: int,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+    ) -> "list[torch.Tensor | tuple[torch.Tensor, ...]]":
+        """Split a fused forward output back into per-branch predictions.
+
+        Mirrors the per-branch postprocessing of the sequential path: each
+        single-tensor prediction is run through ``slice_noise_pred`` so the
+        returned list is interchangeable with sequential branch outputs.
+        """
+        raw_t = _wrap(raw)
+        per_elem_chunks = [torch.split(t, base_bs, dim=0) for t in raw_t]
+        predictions: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
+        for bi in range(n_branches):
+            pred_t = tuple(chunks[bi] for chunks in per_elem_chunks)
+            if len(pred_t) == 1:
+                pred_t = (
+                    server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
+                )
+            predictions.append(_unwrap(pred_t))
+        return predictions
 
     def _build_attn_metadata(
         self,
