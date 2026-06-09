@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    check_gguf_file,
+    maybe_download_model,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
@@ -308,6 +311,35 @@ class _BitsAndBytes4BitAdapter(_TransformerQuantAdapter):
             server_args=self.server_args,
             quant_config=self.quant_config,
         )
+
+
+def resolve_gguf_transformer_path(server_args: ServerArgs) -> Optional[str]:
+    """Return the local ``.gguf`` transformer path if the override is GGUF.
+
+    GGUF transformers are supplied via ``--transformer-weights-path`` pointing at
+    a single ``.gguf`` file (or an HF repo/file that resolves to one). The base
+    model path still provides the architecture config and the non-transformer
+    components (VAE, text encoder). Returns None when the override is not GGUF.
+    """
+    weights_path = server_args.transformer_weights_path
+    if not weights_path:
+        return None
+
+    local_path = maybe_download_model(weights_path)
+    if os.path.isdir(local_path):
+        gguf_files = [f for f in os.listdir(local_path) if f.endswith(".gguf")]
+        if not gguf_files:
+            return None
+        if len(gguf_files) > 1:
+            raise ValueError(
+                f"Multiple .gguf files found in {local_path}: {gguf_files}. "
+                "Point --transformer-weights-path at a single .gguf file."
+            )
+        local_path = os.path.join(local_path, gguf_files[0])
+
+    if check_gguf_file(local_path):
+        return local_path
+    return None
 
 
 def resolve_transformer_safetensors_to_load(

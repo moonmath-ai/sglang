@@ -9,7 +9,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.gguf_load import load_gguf_transformer
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_gguf_transformer_path,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -90,9 +92,16 @@ class TransformerLoader(ComponentLoader):
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
-        safetensors_list = resolve_transformer_safetensors_to_load(
-            component_server_args, component_model_path
-        )
+        # GGUF transformers ship as a single .gguf file and load via a dedicated
+        # on-the-fly-dequant path; the base model still provides the arch config.
+        gguf_path = resolve_gguf_transformer_path(component_server_args)
+
+        if gguf_path is None:
+            safetensors_list = resolve_transformer_safetensors_to_load(
+                component_server_args, component_model_path
+            )
+        else:
+            safetensors_list = []
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -109,6 +118,16 @@ class TransformerLoader(ComponentLoader):
 
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+
+        if gguf_path is not None:
+            return self._load_gguf(
+                model_cls=model_cls,
+                cls_name=cls_name,
+                config=config,
+                dit_config=dit_config,
+                gguf_path=gguf_path,
+                server_args=server_args,
+            )
 
         quant_spec = resolve_transformer_quant_load_spec(
             hf_config=config,
@@ -174,4 +193,49 @@ class TransformerLoader(ComponentLoader):
                 quant_spec.param_dtype,
             )
 
+        return model
+
+    def _load_gguf(
+        self,
+        *,
+        model_cls: type,
+        cls_name: str,
+        config: dict[str, Any],
+        dit_config: Any,
+        gguf_path: str,
+        server_args: ServerArgs,
+    ):
+        """Load a GGUF-quantized transformer (on-the-fly dequant, single GPU)."""
+        from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+        from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+        if server_args.tp_size > 1 or server_args.use_fsdp_inference:
+            raise ValueError(
+                "GGUF transformer loading does not support tensor parallelism or "
+                "FSDP inference; run with tp_size=1 and FSDP inference disabled."
+            )
+
+        quant_config = GGUFConfig()
+        packed = getattr(model_cls, "packed_modules_mapping", None)
+        if packed:
+            quant_config.packed_modules_mapping = packed
+
+        param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        init_params: dict[str, Any] = {
+            "config": dit_config,
+            "hf_config": config,
+            "quant_config": quant_config,
+        }
+
+        logger.info("Loading GGUF %s from %s", cls_name, gguf_path)
+        model = load_gguf_transformer(
+            model_cls=model_cls,
+            init_params=init_params,
+            gguf_file=gguf_path,
+            device=get_local_torch_device(),
+            param_dtype=param_dtype,
+        )
+
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info("Loaded GGUF model with %.2fB parameters", total_params / 1e9)
         return model
