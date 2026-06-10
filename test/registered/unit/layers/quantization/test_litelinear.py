@@ -80,21 +80,6 @@ class TestLiteLinearConfig(CustomTestCase):
 
         self.assertIs(get_quantization_config("litelinear"), LiteLinearConfig)
 
-    def test_model_loader_extra_config_selects_factor_checkpoint_format(self):
-        from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
-
-        config = LiteLinearConfig(rank=16)
-        self.assertIn(
-            "litelinear_checkpoint_format",
-            LiteLinearConfig.get_model_loader_extra_config_keys(),
-        )
-
-        config.update_from_model_loader_extra_config(
-            {"litelinear_checkpoint_format": "factors"}
-        )
-
-        self.assertEqual(config.checkpoint_format, "factors")
-
     def test_from_config_selects_factor_checkpoint_format(self):
         from sglang.srt.layers.quantization.litelinear import LiteLinearConfig
 

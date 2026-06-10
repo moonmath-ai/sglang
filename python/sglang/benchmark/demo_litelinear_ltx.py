@@ -14,6 +14,41 @@ from pathlib import Path
 LTX2_LITELINEAR_DENSE_CONFIG_DIR = (
     Path(__file__).resolve().parent / "litelinear_ltx2_dense_config"
 )
+DEFAULT_LTX2_SNAPSHOT = Path(
+    "/mnt/fs/huggingface_cache/hub/models--Lightricks--LTX-2/snapshots/"
+    "47da56e2ad66ce4125a9922b4a8826bf407f9d0a"
+)
+
+# Modes runnable on CUDA (H100). NPU/ROCm-only methods are listed for reference.
+QUANT_MODES: dict[str, dict[str, str | Path | None]] = {
+    "default": {},
+    "litelinear": {
+        "quantization": "litelinear",
+        "transformer_weights_path": LTX2_LITELINEAR_DENSE_CONFIG_DIR,
+    },
+    "fp8_online": {"quantization": "fp8"},
+    "modelopt_fp8": {
+        "quantization": "modelopt_fp8",
+        "transformer_weights_path": DEFAULT_LTX2_SNAPSHOT
+        / "ltx-2-19b-dev-fp8.safetensors",
+    },
+    "modelopt_fp4": {
+        "quantization": "modelopt_fp4",
+        "transformer_weights_path": DEFAULT_LTX2_SNAPSHOT
+        / "ltx-2-19b-dev-fp4.safetensors",
+    },
+    "mxfp4_online": {"quantization": "mxfp4"},
+    "mxfp8": {"quantization": "mxfp8"},
+    "mxfp4_npu": {"quantization": "mxfp4_npu"},
+    "modelslim": {"quantization": "modelslim"},
+}
+CUDA_QUANT_MODES = (
+    "default",
+    "litelinear",
+    "fp8_online",
+    "modelopt_fp8",
+    "modelopt_fp4",
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +57,7 @@ class RunResult:
     total_duration_ms: float | None
     denoise_ms: float | None
     peak_reserved_mb: float | None
+    transformer_size_gb: float | None
     perf_path: Path
     ok: bool
     error: str = ""
@@ -30,11 +66,24 @@ class RunResult:
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run an LTX video generation demo benchmark with SGLang default "
-            "linear layers and with --quantization litelinear."
+            "Run an LTX video generation demo benchmark comparing default "
+            "linear layers against available SGLang quantization methods."
         )
     )
-    parser.add_argument("--model-path", default="Lightricks/LTX-2")
+    parser.add_argument(
+        "--model-path",
+        default=str(DEFAULT_LTX2_SNAPSHOT)
+        if DEFAULT_LTX2_SNAPSHOT.is_dir()
+        else "Lightricks/LTX-2",
+    )
+    parser.add_argument(
+        "--modes",
+        default=",".join(CUDA_QUANT_MODES),
+        help=(
+            "Comma-separated modes to run. Built-ins: "
+            + ", ".join(QUANT_MODES.keys())
+        ),
+    )
     parser.add_argument("--pipeline-class-name", default="LTX2Pipeline")
     parser.add_argument(
         "--prompt",
@@ -147,13 +196,16 @@ def build_command(args, mode: str, perf_path: Path, output_path: Path) -> list[s
             str(output_path),
         ]
     )
-    if mode == "litelinear":
+    mode_spec = QUANT_MODES.get(mode)
+    if mode_spec is None:
+        raise ValueError(f"Unknown mode {mode!r}. Choose from: {sorted(QUANT_MODES)}")
+    if mode_spec.get("quantization"):
+        cmd.extend(["--quantization", str(mode_spec["quantization"])])
+    if mode_spec.get("transformer_weights_path"):
         cmd.extend(
             [
-                "--quantization",
-                "litelinear",
                 "--transformer-weights-path",
-                str(LTX2_LITELINEAR_DENSE_CONFIG_DIR),
+                str(mode_spec["transformer_weights_path"]),
             ]
         )
     cmd.extend(args.extra_arg)
@@ -179,6 +231,16 @@ def read_perf(path: Path) -> tuple[float | None, float | None, float | None]:
     return total_duration_ms, denoise_ms, peak_reserved_mb
 
 
+def parse_transformer_size_gb(log_path: Path) -> float | None:
+    if not log_path.exists():
+        return None
+    match = re.search(
+        r"Loaded transformer:.*model size:\s*([0-9.]+)\s*GB",
+        log_path.read_text(encoding="utf-8", errors="replace"),
+    )
+    return float(match.group(1)) if match else None
+
+
 def run_mode(args, mode: str, result_dir: Path, env: dict[str, str]) -> RunResult:
     perf_path = result_dir / f"{safe_name(mode)}.perf.json"
     output_path = result_dir / f"{safe_name(mode)}.mp4"
@@ -186,7 +248,7 @@ def run_mode(args, mode: str, result_dir: Path, env: dict[str, str]) -> RunResul
     cmd = build_command(args, mode, perf_path, output_path)
     print("\n$ " + " ".join(cmd), flush=True)
     if args.dry_run:
-        return RunResult(mode, None, None, None, perf_path, ok=True)
+        return RunResult(mode, None, None, None, None, perf_path, ok=True)
 
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
@@ -210,6 +272,7 @@ def run_mode(args, mode: str, result_dir: Path, env: dict[str, str]) -> RunResul
             None,
             None,
             None,
+            None,
             perf_path,
             ok=False,
             error=f"exit code {returncode}",
@@ -221,17 +284,20 @@ def run_mode(args, mode: str, result_dir: Path, env: dict[str, str]) -> RunResul
             None,
             None,
             None,
+            None,
             perf_path,
             ok=False,
             error=f"missing perf dump: {perf_path}",
         )
 
     total_duration_ms, denoise_ms, peak_reserved_mb = read_perf(perf_path)
+    transformer_size_gb = parse_transformer_size_gb(log_path)
     return RunResult(
         mode,
         total_duration_ms,
         denoise_ms,
         peak_reserved_mb,
+        transformer_size_gb,
         perf_path,
         ok=True,
     )
@@ -249,27 +315,45 @@ def format_change(default: float | None, value: float | None) -> str:
     return f"{speedup:.3f}x ({faster:+.2f}%)"
 
 
-def print_table(results: list[RunResult]):
-    default = next((item for item in results if item.mode == "default"), None)
-    default_total = default.total_duration_ms if default else None
-    default_denoise = default.denoise_ms if default else None
+def format_gb(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
 
-    print("\nLTX LiteLinear Demo Summary")
+
+def print_table(results: list[RunResult]):
+    baseline = next((item for item in results if item.mode == "default" and item.ok), None)
+    if baseline is None:
+        baseline = next((item for item in results if item.ok), None)
+    default_total = baseline.total_duration_ms if baseline else None
+    default_denoise = baseline.denoise_ms if baseline else None
+    default_transformer = baseline.transformer_size_gb if baseline else None
+
+    print("\nLTX Quantization Comparison")
     print(
-        "| Mode | OK | total ms | denoise ms | peak reserved MB | "
-        "total change | denoise change |"
+        "| Mode | OK | transformer GB | total ms | denoise ms | "
+        "peak reserved MB | total vs baseline | denoise vs baseline | "
+        "transformer mem vs baseline |"
     )
-    print("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for result in results:
+        mem_change = "n/a"
+        if default_transformer and result.transformer_size_gb:
+            delta = (
+                (default_transformer - result.transformer_size_gb)
+                / default_transformer
+                * 100.0
+            )
+            mem_change = f"{delta:+.1f}%"
         print(
             "| "
             f"{result.mode} | "
             f"{'yes' if result.ok else 'no'} | "
+            f"{format_gb(result.transformer_size_gb)} | "
             f"{format_ms(result.total_duration_ms)} | "
             f"{format_ms(result.denoise_ms)} | "
             f"{format_ms(result.peak_reserved_mb)} | "
             f"{format_change(default_total, result.total_duration_ms)} | "
-            f"{format_change(default_denoise, result.denoise_ms)} |"
+            f"{format_change(default_denoise, result.denoise_ms)} | "
+            f"{mem_change} |"
         )
         if result.error:
             print(f"# {result.mode} error: {result.error}", file=sys.stderr)
@@ -289,13 +373,18 @@ def main():
         print(path)
         return
 
+    unknown = [mode for mode in args.modes.split(",") if mode not in QUANT_MODES]
+    if unknown:
+        raise SystemExit(f"Unknown mode(s): {unknown}. Choose from: {sorted(QUANT_MODES)}")
+
     results = [
-        run_mode(args, "default", result_dir, env),
-        run_mode(args, "litelinear", result_dir, env),
+        run_mode(args, mode.strip(), result_dir, env)
+        for mode in args.modes.split(",")
+        if mode.strip()
     ]
     print_table(results)
 
-    if not all(result.ok for result in results):
+    if not any(result.ok for result in results):
         raise SystemExit(1)
 
 

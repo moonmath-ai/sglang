@@ -130,6 +130,52 @@ class TestMultimodalLiteLinearConfig(CustomTestCase):
         self.assertEqual(config.checkpoint_format, "factors")
         self.assertEqual(config.rank, 32)
 
+    def test_transformer_weights_path_resolves_litelinear_config(self):
+        import json
+        import tempfile
+
+        from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+            _resolve_quant_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = f"{tmpdir}/config.json"
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "quantization_config": {
+                            "quant_method": "litelinear",
+                            "checkpoint_format": "factors",
+                            "rank": 32,
+                            "target_patterns": [
+                                r"transformer_blocks\..*(audio_)?ff\.proj_(in|out)$"
+                            ],
+                        }
+                    },
+                    f,
+                )
+
+            config = _resolve_quant_config(
+                hf_config={},
+                server_args=types.SimpleNamespace(
+                    quantization=None,
+                    transformer_weights_path=tmpdir,
+                    pipeline_config=types.SimpleNamespace(
+                        dit_config=types.SimpleNamespace(
+                            arch_config=types.SimpleNamespace(
+                                param_names_mapping={},
+                                reverse_param_names_mapping=None,
+                            )
+                        )
+                    ),
+                ),
+                safetensors_list=[],
+                component_model_path="/tmp/component",
+            )
+
+        self.assertEqual(config.checkpoint_format, "factors")
+        self.assertEqual(config.rank, 32)
+
     def test_process_weights_and_apply_dispatch_through_litelinear(self):
         from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
         from sglang.multimodal_gen.runtime.layers.quantization.litelinear import (

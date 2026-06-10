@@ -178,26 +178,6 @@ class QuantizationConfig(ABC):
         return None
 
     @classmethod
-    def get_model_loader_extra_config_keys(cls) -> List[str]:
-        """Extra model-loader config keys accepted by this quantization method."""
-        return []
-
-    def update_from_model_loader_extra_config(
-        self, model_loader_extra_config: Dict[str, Any]
-    ) -> None:
-        """Let quantization methods consume model-loader config after creation."""
-        pass
-
-    @classmethod
-    def maybe_process_safetensors_files(
-        cls,
-        hf_weights_files: List[str],
-        model_loader_extra_config: Dict[str, Any],
-    ) -> List[str]:
-        """Let quantization methods redirect safetensors files before loading."""
-        return hf_weights_files
-
-    @classmethod
     def _modelopt_override_quantization_method(
         cls, hf_quant_config, user_quant
     ) -> Optional[str]:

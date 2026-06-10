@@ -29,7 +29,6 @@ class LiteLinearConfig(QuantizationConfig):
     DEFAULT_MIN_INPUT_SIZE = 4096
     DEFAULT_MIN_OUTPUT_RATIO = 2.0
     DEFAULT_MAX_OUTPUT_RATIO = 12.0
-    MODEL_LOADER_EXTRA_CONFIG_KEYS = ["litelinear_checkpoint_format"]
     CHECKPOINT_FORMAT_DENSE = "dense"
     CHECKPOINT_FORMAT_FACTORS = "factors"
 
@@ -134,21 +133,6 @@ class LiteLinearConfig(QuantizationConfig):
                 cls.CHECKPOINT_FORMAT_DENSE,
             ),
         )
-
-    @classmethod
-    def get_model_loader_extra_config_keys(cls) -> List[str]:
-        return cls.MODEL_LOADER_EXTRA_CONFIG_KEYS
-
-    def update_from_model_loader_extra_config(
-        self, model_loader_extra_config: Dict[str, Any]
-    ) -> None:
-        checkpoint_format = model_loader_extra_config.get(
-            "litelinear_checkpoint_format"
-        )
-        if checkpoint_format is not None:
-            self.checkpoint_format = self._normalize_checkpoint_format(
-                checkpoint_format
-            )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

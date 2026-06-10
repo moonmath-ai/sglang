@@ -76,10 +76,6 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization import (
-    QUANTIZATION_METHODS,
-    get_quantization_config,
-)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -244,9 +240,6 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        quant_config.update_from_model_loader_extra_config(
-            load_config.model_loader_extra_config or {}
-        )
         # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
@@ -377,12 +370,7 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
-        allowed_keys = {
-            "enable_multithread_load",
-            "num_threads",
-        }
-        for quant_config_cls in QUANTIZATION_METHODS.values():
-            allowed_keys.update(quant_config_cls.get_model_loader_extra_config_keys())
+        allowed_keys = {"enable_multithread_load", "num_threads"}
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -545,14 +533,6 @@ class DefaultModelLoader(BaseModelLoader):
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
             )
-            if source.model_config.quantization is not None:
-                quant_config_cls = get_quantization_config(
-                    source.model_config.quantization
-                )
-                hf_weights_files = quant_config_cls.maybe_process_safetensors_files(
-                    hf_weights_files,
-                    extra_config,
-                )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
