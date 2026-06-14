@@ -52,9 +52,7 @@ class FakeLiteLinear(nn.Module):
         self.register_buffer("A", state_dict["A"].detach().clone())
         self.register_buffer("B", state_dict["B"].detach().clone())
         self.register_buffer("Q_fp8", state_dict["Q_fp8"].detach().clone())
-        self.register_buffer(
-            "Q_scale_inv", state_dict["Q_scale_inv"].detach().clone()
-        )
+        self.register_buffer("Q_scale_inv", state_dict["Q_scale_inv"].detach().clone())
         self.register_parameter("weight", None)
         self.materialized = True
         return nn.modules.module._IncompatibleKeys([], [])
@@ -283,7 +281,6 @@ class TestMultimodalLiteLinearConfig(CustomTestCase):
         self.assertIsNone(layer.Q_fp8)
         self.assertIsNone(layer.Q_scale_inv)
         self.assertTrue(FakeLiteLinear.instances[0].materialized)
-
 
     def test_requires_target_patterns(self):
         from sglang.multimodal_gen.runtime.layers.quantization.litelinear import (

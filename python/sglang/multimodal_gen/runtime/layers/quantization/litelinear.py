@@ -40,9 +40,7 @@ class LiteLinearConfig(QuantizationConfig):
 
         self.rank = rank
         self.checkpoint_format = self._normalize_checkpoint_format(checkpoint_format)
-        self.target_patterns = self._normalize_string_list(
-            target_patterns, default=[]
-        )
+        self.target_patterns = self._normalize_string_list(target_patterns, default=[])
         if not self.target_patterns:
             raise ValueError(
                 "LiteLinear requires target_patterns regex entries. "

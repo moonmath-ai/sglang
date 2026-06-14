@@ -66,9 +66,7 @@ class LiteLinearConfig(QuantizationConfig):
         self.min_input_size = min_input_size
         self.min_output_ratio = min_output_ratio
         self.max_output_ratio = max_output_ratio
-        self.target_patterns = self._normalize_string_list(
-            target_patterns, default=[]
-        )
+        self.target_patterns = self._normalize_string_list(target_patterns, default=[])
         self.ignored_layers = self._normalize_string_list(ignored_layers, default=[])
         self.packed_modules_mapping = packed_modules_mapping or {}
         self._compiled_target_patterns = [
