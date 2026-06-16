@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.diffusion_continuous_batching import (
+    DiffusionRequestState,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
@@ -45,6 +48,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     LoRAPipeline,
     Req,
     build_pipeline,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -535,6 +541,180 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
         peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+
+    # ------------------------------------------------------------------
+    # Continuous batching StepRunner protocol (see
+    # runtime/managers/diffusion_continuous_batching.py): drive the denoising loop
+    # one step at a time so the scheduler can interleave several running requests.
+    # ------------------------------------------------------------------
+
+    def cb_can_run(self, req: Req) -> tuple[bool, str | None]:
+        """Whether ``req`` can be served via the stepwise continuous path."""
+        assert self.pipeline is not None
+        if self.pipeline.cb_split_stages() is None:
+            return False, "pipeline does not expose a single standard denoising stage"
+        mode = getattr(req, "progressive_mode", "fullres") or "fullres"
+        if mode != "fullres":
+            return False, f"progressive resolution mode {mode!r} is not supported"
+        denoising = self.pipeline.get_denoising_stage()
+        return denoising.cb_supports(req)
+
+    def _cb_batch_key(self, req: Req, ctx: Any) -> tuple:
+        """Opaque compatibility key: groups with equal keys may share a forward.
+
+        Keys on the **per-sample** latent shape (excludes the batch dim) so groups
+        of different sizes can still fuse, and on guidance config. Excludes
+        ``num_inference_steps`` so groups with different total step counts coexist.
+        """
+        per_sample_shape = (
+            tuple(ctx.latents.shape[1:]) if ctx.latents is not None else None
+        )
+
+        def _f(value):
+            return float(value) if value is not None else None
+
+        return (
+            self.server_args.pipeline_config.task_type,
+            per_sample_shape,
+            str(ctx.target_dtype),
+            bool(req.do_classifier_free_guidance),
+            _f(req.guidance_scale),
+            _f(req.guidance_scale_2),
+            # CFG combine applies a batch-level rescale/true-cfg postprocess using
+            # one representative request, so these must match across a fused group.
+            _f(getattr(req, "true_cfg_scale", None)),
+            _f(getattr(req, "guidance_rescale", None)),
+        )
+
+    def cb_prepare(
+        self,
+        identities: list[bytes | None],
+        original_reqs: list[Req],
+        merged_req: Req,
+    ) -> DiffusionRequestState:
+        """Run the pre-denoise stages on the *merged* batch req (batched encode).
+
+        The denoise loop is then stepped on the batched context; the encode here
+        and the decode in ``cb_finalize`` are batched across the whole group,
+        matching dynamic batching's whole-pipeline batching.
+        """
+        assert self.pipeline is not None
+        state = DiffusionRequestState(
+            identities=identities,
+            original_reqs=original_reqs,
+            request_id=merged_req.request_id,
+            batch_key=None,
+            num_steps=0,
+            req=merged_req,
+        )
+        req = merged_req
+        try:
+            self._realtime_sessions.attach(req)
+            req.log(server_args=self.server_args)
+            self.pipeline.cb_setup_residency(self.server_args)
+            split = self.pipeline.cb_split_stages()
+            if split is None:
+                state.error = "continuous batching: pipeline is not step-splittable"
+                return state
+            pre_stages, denoising, _post_stages = split
+            req = self.pipeline.cb_run_stages(pre_stages, req, self.server_args)
+            assert isinstance(req, Req), "pre-denoise stages must return a Req"
+            # Isolate the scheduler: the timestep-prep stage hands every request
+            # the stage's shared scheduler runtime (fine when groups run one at a
+            # time, but continuous batching steps several concurrently, so they
+            # must not share `_step_index`/sigmas state).
+            if req.scheduler is not None:
+                req.scheduler = clone_scheduler_runtime(req.scheduler)
+            ctx = denoising.cb_begin(req, self.server_args)
+            state.req = req
+            state.ctx = ctx
+            state.num_steps = denoising.cb_num_steps(ctx)
+            state.batch_key = self._cb_batch_key(req, ctx)
+        except Exception as e:
+            logger.error(
+                "Continuous batching cb_prepare failed for group %s: %s",
+                merged_req.request_id,
+                e,
+                exc_info=True,
+            )
+            state.error = f"continuous batching prepare failed: {e}"
+        return state
+
+    def cb_step(self, group: list[DiffusionRequestState]) -> None:
+        assert self.pipeline is not None
+        denoising = self.pipeline.get_denoising_stage()
+        active = [s for s in group if s.error is None and not s.is_finished()]
+        if not active:
+            return
+        with current_platform.inference_mode():
+            # Try to fuse the group's denoise step into one model forward.
+            # cb_run_step_fused mutates nothing before the forward, so a False
+            # return or a (pre-mutation) forward exception is a safe fallback.
+            if self.server_args.diffusion_cb_fuse_forward and len(active) >= 2:
+                try:
+                    fused = denoising.cb_run_step_fused(
+                        [s.ctx for s in active],
+                        [s.req for s in active],
+                        [s.step_index for s in active],
+                        self.server_args,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Continuous batching fused step raised; falling back to "
+                        "per-request stepping for this group. %s",
+                        e,
+                        exc_info=True,
+                    )
+                    fused = False
+                if fused:
+                    for state in active:
+                        state.step_index += 1
+                    return
+
+            # Step each request individually (also the fused-path fallback).
+            for state in active:
+                try:
+                    denoising.cb_run_step(
+                        state.ctx, state.req, self.server_args, state.step_index
+                    )
+                    state.step_index += 1
+                except Exception as e:
+                    logger.error(
+                        "Continuous batching cb_step failed for request %s at "
+                        "step %d: %s",
+                        state.request_id,
+                        state.step_index,
+                        e,
+                        exc_info=True,
+                    )
+                    state.error = f"continuous batching step failed: {e}"
+
+    def cb_finalize(self, state: DiffusionRequestState) -> OutputBatch:
+        assert self.pipeline is not None
+        denoising = self.pipeline.get_denoising_stage()
+        split = self.pipeline.cb_split_stages()
+        assert split is not None, "cb_finalize called on a non-splittable pipeline"
+        _pre_stages, _denoising, post_stages = split
+        req = state.req
+
+        def forward_fn() -> OutputBatch | Req:
+            denoising.cb_end(state.ctx, req, self.server_args)
+            return self.pipeline.cb_run_stages(post_stages, req, self.server_args)
+
+        return self._execute_forward_common(
+            req,
+            forward_fn=forward_fn,
+            log_reqs=[req],
+            return_req=False,
+            save_output_paths=lambda output_batch: self._save_output_paths(
+                req, output_batch
+            ),
+            error_context=f"request {req.request_id} (continuous batching finalize)",
+        )
+
+    def cb_make_error_output(self, state: DiffusionRequestState) -> OutputBatch:
+        metrics = getattr(state.req, "metrics", None) if state.req else None
+        return OutputBatch(error=state.error, metrics=metrics)
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None

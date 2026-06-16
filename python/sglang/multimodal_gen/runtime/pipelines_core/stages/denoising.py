@@ -11,7 +11,7 @@ import os
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
 from typing import Any
 
@@ -988,6 +988,45 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         below; mirror them in the override if those markers are needed.
         """
         use_nvtx = self.current_use_nvtx
+        # 1-3. Build the scaled latent model input and the expanded timestep.
+        latent_model_input, timestep = self._build_forward_inputs(
+            ctx, step, batch, server_args
+        )
+
+        # 4. Run the model prediction path, including CFG when enabled.
+        with maybe_nvtx_range("predict_noise", use_nvtx):
+            noise_pred = self._predict_noise_with_cfg(
+                current_model=step.current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=step.step_index,
+                attn_metadata=step.attn_metadata,
+                target_dtype=ctx.target_dtype,
+                current_guidance_scale=step.current_guidance_scale,
+                cfg_policy=ctx.cfg_policy,
+                cfg_gate_state=ctx.extra.get("cfg_gate_state"),
+                server_args=server_args,
+                guidance=ctx.guidance,
+                latents=ctx.latents,
+            )
+
+        # 5-6. Advance the scheduler and re-apply model-specific constraints.
+        with maybe_nvtx_range("scheduler_step", use_nvtx):
+            self._apply_scheduler_step(ctx, step, batch, server_args, noise_pred)
+
+    def _build_forward_inputs(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> "tuple[torch.Tensor, Any]":
+        """Steps 1-3 of a denoising step: scaled latent input + expanded timestep.
+
+        Factored out of ``_run_denoising_step`` so the continuous-batching fused
+        path can build per-request inputs before concatenating them.
+        """
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
@@ -1012,36 +1051,32 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         latent_model_input = ctx.scheduler.scale_model_input(
             latent_model_input, step.t_device
         )
+        return latent_model_input, timestep
 
-        # 4. Run the model prediction path, including CFG when enabled.
-        with maybe_nvtx_range("predict_noise", use_nvtx):
-            noise_pred = self._predict_noise_with_cfg(
-                current_model=step.current_model,
-                latent_model_input=latent_model_input,
-                timestep=timestep,
-                batch=batch,
-                timestep_index=step.step_index,
-                attn_metadata=step.attn_metadata,
-                target_dtype=ctx.target_dtype,
-                current_guidance_scale=step.current_guidance_scale,
-                cfg_policy=ctx.cfg_policy,
-                cfg_gate_state=ctx.extra.get("cfg_gate_state"),
-                server_args=server_args,
-                guidance=ctx.guidance,
-                latents=ctx.latents,
-            )
+    def _apply_scheduler_step(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+        noise_pred: "torch.Tensor",
+    ) -> None:
+        """Steps 5-6 of a denoising step: scheduler update + TI2V constraints.
+
+        Uses this request's own ``ctx.scheduler`` and timestep, so it stays
+        correct when several requests at different steps share a fused forward.
+        """
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
 
         # 5. Advance the scheduler state with the predicted noise.
-        with maybe_nvtx_range("scheduler_step", use_nvtx):
-            ctx.latents = ctx.scheduler.step(
-                model_output=noise_pred,
-                timestep=step.t_device,
-                sample=ctx.latents,
-                **ctx.extra_step_kwargs,
-                return_dict=False,
-            )[0]
+        ctx.latents = ctx.scheduler.step(
+            model_output=noise_pred,
+            timestep=step.t_device,
+            sample=ctx.latents,
+            **ctx.extra_step_kwargs,
+            return_dict=False,
+        )[0]
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1337,6 +1372,432 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
+    # ------------------------------------------------------------------
+    # Step-level execution hooks for continuous batching. They split ``forward``'s
+    # denoising loop so an external driver can interleave one step at a time across
+    # concurrent requests, reusing the same per-step body (``_prepare_step_state``
+    # -> ``_run_denoising_step`` -> ``_record_trajectory``) as the monolithic path.
+    # ------------------------------------------------------------------
+
+    def cb_supports(self, batch: Req) -> tuple[bool, str | None]:
+        """Whether this request can be driven step-by-step. (reason if not)."""
+        # A subclass that overrides ``forward`` has a custom loop the base hooks
+        # don't reproduce (e.g. LTX-2's joint audio+video) — driving it stepwise
+        # would silently skip that work. Overriding only step *helpers* is fine.
+        if type(self).forward is not DenoisingStage.forward:
+            return (
+                False,
+                f"{type(self).__name__} overrides the denoising loop "
+                "(unsupported by continuous batching)",
+            )
+        if batch.rollout:
+            return False, "rollout collection is not supported with continuous batching"
+        if self._sp_world_size() > 1:
+            return (
+                False,
+                "sequence parallelism is not supported with continuous batching",
+            )
+        return True, None
+
+    @torch.no_grad()
+    def cb_begin(self, batch: Req, server_args: ServerArgs) -> DenoisingContext:
+        """Prepare denoising state for stepwise execution (mirrors ``forward`` setup)."""
+        supported, reason = self.cb_supports(batch)
+        if not supported:
+            raise NotImplementedError(reason)
+        ctx = self._prepare_denoising_loop(batch, server_args)
+        self._before_denoising_loop(ctx, batch, server_args)
+        # Cache the loop-invariant CPU timesteps and the resolved nvtx gate so
+        # every subsequent ``cb_run_step`` reuses them instead of recomputing.
+        ctx.extra["cb_timesteps_cpu"] = ctx.timesteps.cpu()
+        ctx.extra["cb_num_timesteps"] = ctx.extra["cb_timesteps_cpu"].shape[0]
+        ctx.extra["cb_use_nvtx"] = self._apply_nvtx_gate(ctx.is_warmup)
+        ctx.extra["cb_start_time"] = time.time()
+        return ctx
+
+    def cb_num_steps(self, ctx: DenoisingContext) -> int:
+        return int(ctx.extra["cb_num_timesteps"])
+
+    @torch.no_grad()
+    def cb_run_step(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+    ) -> None:
+        """Run exactly one denoising step (the body of ``forward``'s loop)."""
+        timesteps_cpu = ctx.extra["cb_timesteps_cpu"]
+        t_host = timesteps_cpu[step_index]
+        use_nvtx = ctx.extra["cb_use_nvtx"]
+        self._current_use_nvtx = use_nvtx
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=ctx.target_dtype,
+                enabled=ctx.autocast_enabled,
+            ),
+            maybe_nvtx_range(
+                f"denoising_step_{step_index}_t{t_host.item():.4g}", use_nvtx
+            ),
+            StageProfiler(
+                f"denoising_step_{step_index}",
+                logger=logger,
+                metrics=batch.metrics,
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+                record_as_step=True,
+            ),
+        ):
+            step = self._prepare_step_state(
+                ctx, batch, server_args, step_index, t_host, timesteps_cpu
+            )
+            self._run_denoising_step(ctx, step, batch, server_args)
+            self._record_trajectory(ctx, step, batch, server_args)
+            if not ctx.is_warmup:
+                self.step_profile()
+
+    @torch.no_grad()
+    def cb_end(self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs) -> Req:
+        """Finalize the denoising loop after the last step (mirrors ``forward`` tail)."""
+        num_timesteps = self.cb_num_steps(ctx)
+        if num_timesteps > 0 and not ctx.is_warmup:
+            elapsed = time.time() - ctx.extra.get("cb_start_time", time.time())
+            self.log_info(
+                "average time per step: %.4f seconds", elapsed / num_timesteps
+            )
+        self._finish_active_component_use()
+        self._finalize_denoising_loop(ctx, batch, server_args)
+        return batch
+
+    # ------------------------------------------------------------------
+    # Continuous batching fused forward: fuse several compatible requests' denoise
+    # step into ONE batched model forward, then advance each request's scheduler
+    # independently (each keeps its own timestep + scheduler state, so requests
+    # at *different* progress can share the forward). Any config that keeps
+    # step-index-keyed state (cache-dit, sparse attention, TeaCache) bails out so
+    # the caller falls back to per-request stepping.
+    # ------------------------------------------------------------------
+
+    def cb_group_fusable(
+        self,
+        ctxs: list[DenoisingContext],
+        reqs: list[Req],
+        server_args: ServerArgs,
+    ) -> bool:
+        """Whether this group of requests may share one fused denoise forward."""
+        if len(ctxs) < 2:
+            return False
+        if server_args.comfyui_mode or server_args.enable_cfg_parallel:
+            return False
+        # Single transformer only: dual-transformer (Wan2.2) switches model by
+        # per-step timestep, which a fused different-progress batch cannot share.
+        if self.transformer_2 is not None:
+            return False
+        # cache-dit / sparse attention / TeaCache all key state on the step
+        # index, which is not shared across a different-progress fused batch.
+        if self._cache_dit_enabled:
+            return False
+        if self.attn_backend is not None and self.attn_backend.get_enum() in (
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+        ):
+            return False
+        # The group must be homogeneous in CFG mode (the scheduler's batch_key
+        # already enforces this, but a fused forward depends on it).
+        if len({bool(b.do_classifier_free_guidance) for b in reqs}) != 1:
+            return False
+        for ctx, batch in zip(ctxs, reqs):
+            if getattr(batch, "enable_teacache", False):
+                return False
+            if ctx.seq_len is not None:
+                return False  # Wan TI2V uses per-request token-length expansion
+            policy = ctx.cfg_policy
+            if policy is None:
+                return False
+            # The CFG residual-reuse gate caches state across a single request's
+            # steps; it cannot be shared across a different-progress fused batch.
+            gate = ctx.extra.get("cfg_gate_state")
+            if gate and gate.get("active"):
+                return False
+            if batch.do_classifier_free_guidance:
+                # Standard 2-branch CFG only (cond + uncond).
+                if len(policy.branches) != 2:
+                    return False
+            elif len(policy.branches) != 1:
+                return False
+        return True
+
+    @staticmethod
+    def _cb_merge_value(vals: list[Any], base_bs: int) -> Any:
+        """Merge one kwarg across requests for a fused forward.
+
+        Stricter than CFG-branch merging: only tensors whose leading dim equals
+        the per-request batch size are concatenated (per-sample data such as
+        prompt embeds / masks). Tensors without that batch dim (shared
+        positional encodings like rotary embeddings) are required to match and
+        pass through unchanged. Returns the sentinel ``False`` when the values
+        cannot be safely fused.
+        """
+        first = vals[0]
+        if isinstance(first, torch.Tensor):
+            if any(
+                not isinstance(v, torch.Tensor)
+                or v.shape[1:] != first.shape[1:]
+                or v.dtype != first.dtype
+                for v in vals
+            ):
+                return False
+            if first.shape[0] == base_bs:
+                return torch.cat(vals, dim=0)
+            # Shared (non-per-sample) tensor: must be identical across requests.
+            if any(v.shape != first.shape for v in vals):
+                return False
+            return first
+        if isinstance(first, (list, tuple)):
+            if any(
+                not isinstance(v, (list, tuple)) or len(v) != len(first) for v in vals
+            ):
+                return False
+            # Per-image sequence: a *list* (not tuple — tuples are fixed structures
+            # like rotary ``(cos, sin)`` that extending would corrupt) of length
+            # base_bs whose entries lack a batch dim is one-entry-per-image (e.g.
+            # Z-Image's variable-length [L, D] captions). Extend it across requests.
+            # If the entries already carry the batch dim (e.g. Wan's
+            # ``[tensor(1, 512, D)]`` context list) fall through and recurse instead.
+            if (
+                isinstance(first, list)
+                and len(first) == base_bs
+                and all(isinstance(e, torch.Tensor) for v in vals for e in v)
+                and not all(
+                    e.ndim >= 1 and e.shape[0] == base_bs for v in vals for e in v
+                )
+            ):
+                extended: list = []
+                for v in vals:
+                    extended.extend(v)
+                return type(first)(extended)
+            # Otherwise a fixed structure (e.g. rotary tuple[tuple[cos, sin], ...]):
+            # recurse element-wise; per-sample leaves are concatenated and shared
+            # leaves pass through.
+            fused = []
+            for elems in zip(*vals):
+                merged = DenoisingStage._cb_merge_value(list(elems), base_bs)
+                if merged is False:
+                    return False
+                fused.append(merged)
+            return type(first)(fused)
+        # Non-tensor: must be identical (object identity or safe equality).
+        if all(v is first for v in vals[1:]):
+            return first
+        try:
+            if all(bool(v == first) for v in vals[1:]):
+                return first
+        except Exception:
+            return False
+        return False
+
+    def _cb_merge_request_kwargs(
+        self, kwargs_list: list[dict[str, Any]], base_bs: int
+    ) -> dict[str, Any] | None:
+        """Concatenate per-request conditional kwargs into one fused kwarg dict."""
+        keys = kwargs_list[0].keys()
+        if any(set(k.keys()) != set(keys) for k in kwargs_list):
+            return None
+        merged: dict[str, Any] = {}
+        for key in keys:
+            value = self._cb_merge_value([k[key] for k in kwargs_list], base_bs)
+            if value is False:
+
+                def _describe(v):
+                    if isinstance(v, torch.Tensor):
+                        return f"Tensor{tuple(v.shape)}:{v.dtype}"
+                    if isinstance(v, (list, tuple)):
+                        return (
+                            f"{type(v).__name__}[{', '.join(_describe(e) for e in v)}]"
+                        )
+                    return type(v).__name__
+
+                logger.warning_once(
+                    f"Continuous batching fused forward: kwarg {key!r} cannot be "
+                    "concatenated across requests (base_bs="
+                    f"{base_bs}, values={[_describe(k[key]) for k in kwargs_list]}); "
+                    "falling back to per-request stepping for this group."
+                )
+                return None
+            merged[key] = value
+        return merged
+
+    def _cb_build_merged_cfg_policy(
+        self, ctxs: list[DenoisingContext], base_bs: int
+    ) -> "CFGPolicy | None":
+        """Build a CFG policy whose branch kwargs are concatenated across requests.
+
+        Reuses each request's own policy type/branches (so per-model ``combine``
+        and branch structure are preserved) and only swaps in the cross-request
+        merged kwargs, so ``_predict_noise_with_cfg`` runs once over the fused
+        N-request batch. Returns ``None`` if any branch's kwargs cannot fuse.
+        """
+        template = ctxs[0].cfg_policy
+        merged_branches = []
+        for b, branch in enumerate(template.branches):
+            merged_kwargs = self._cb_merge_request_kwargs(
+                [ctx.cfg_policy.branches[b].kwargs for ctx in ctxs], base_bs
+            )
+            if merged_kwargs is None:
+                return None
+            merged_branches.append(replace(branch, kwargs=merged_kwargs))
+        return replace(template, branches=merged_branches)
+
+    @torch.no_grad()
+    def cb_run_step_fused(
+        self,
+        ctxs: list[DenoisingContext],
+        reqs: list[Req],
+        step_indices: list[int],
+        server_args: ServerArgs,
+    ) -> bool:
+        """Advance a compatible group by one step with a single fused forward.
+
+        Returns ``True`` only after every request has been advanced. Returns
+        ``False`` (with NO request mutated) when the group cannot be fused, so
+        the caller can step them per-request instead. Exceptions raised here
+        originate from the (pre-mutation) forward and signal a clean fallback.
+        """
+        if not self.cb_group_fusable(ctxs, reqs, server_args):
+            return False
+
+        # Build per-request step state and scaled inputs (no mutation yet).
+        steps: list[DenoisingStepState] = []
+        latent_inputs: list[torch.Tensor] = []
+        timesteps: list[Any] = []
+        for ctx, batch, step_index in zip(ctxs, reqs, step_indices):
+            timesteps_cpu = ctx.extra["cb_timesteps_cpu"]
+            step = self._prepare_step_state(
+                ctx,
+                batch,
+                server_args,
+                step_index,
+                timesteps_cpu[step_index],
+                timesteps_cpu,
+            )
+            lmi, ts = self._build_forward_inputs(ctx, step, batch, server_args)
+            steps.append(step)
+            latent_inputs.append(lmi)
+            timesteps.append(ts)
+
+        base_bs = latent_inputs[0].shape[0]
+        if any(
+            lmi.shape[0] != base_bs or lmi.shape[1:] != latent_inputs[0].shape[1:]
+            for lmi in latent_inputs
+        ):
+            return False
+
+        batched_timestep = self._cb_merge_value(timesteps, base_bs)
+        if batched_timestep is False:
+            return False
+
+        batched_latent = torch.cat(latent_inputs, dim=0)
+        current_model = steps[0].current_model
+        target_dtype = ctxs[0].target_dtype
+        use_nvtx = ctxs[0].extra.get("cb_use_nvtx", False)
+        do_cfg = bool(reqs[0].do_classifier_free_guidance)
+
+        # The merged conditioning (prompt embeds / masks / rotary / CFG policy /
+        # guidance) is invariant across a group's denoise steps, so cache it keyed
+        # by the group's request ids rather than re-concatenating it every step.
+        cache_store = getattr(self, "_cb_fused_cache", None)
+        if cache_store is None:
+            cache_store = self._cb_fused_cache = {}
+        group_key = tuple(r.request_id for r in reqs)
+        cached = cache_store.get(group_key)
+        if cached is None:
+            batched_guidance = self._cb_merge_value(
+                [ctx.guidance for ctx in ctxs], base_bs
+            )
+            if batched_guidance is False:
+                return False
+            if do_cfg:
+                merged = self._cb_build_merged_cfg_policy(ctxs, base_bs)
+                cond_payload = ("policy", merged)
+            else:
+                merged = self._cb_merge_request_kwargs(
+                    [ctx.cfg_policy.branches[0].kwargs for ctx in ctxs], base_bs
+                )
+                cond_payload = ("cond_kwargs", merged)
+            if merged is None:
+                return False
+            if len(cache_store) >= 64:
+                cache_store.clear()
+            cached = {"guidance": batched_guidance, "cond": cond_payload}
+            cache_store[group_key] = cached
+        batched_guidance = cached["guidance"]
+        cond_kind, cond_value = cached["cond"]
+
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=ctxs[0].autocast_enabled,
+            ),
+            maybe_nvtx_range("cb_fused_predict_noise", use_nvtx),
+        ):
+            if do_cfg:
+                # CFG: reuse the (cached) merged policy via _predict_noise_with_cfg,
+                # which runs both branches over the fused N-request batch (one 2N
+                # forward with batched CFG, else two N forwards) and combines them,
+                # returning N already-sliced per-request estimates.
+                combined = self._predict_noise_with_cfg(
+                    current_model=current_model,
+                    latent_model_input=batched_latent,
+                    timestep=batched_timestep,
+                    batch=reqs[0],
+                    timestep_index=step_indices[0],
+                    attn_metadata=steps[0].attn_metadata,
+                    target_dtype=target_dtype,
+                    current_guidance_scale=steps[0].current_guidance_scale,
+                    cfg_policy=cond_value,
+                    cfg_gate_state=None,
+                    server_args=server_args,
+                    guidance=batched_guidance,
+                    latents=batched_latent,
+                )
+                per_request_preds = self._split_batched_prediction(
+                    combined, len(ctxs), base_bs, None, server_args
+                )
+            else:
+                # Non-CFG: a single conditional branch -> one fused forward.
+                cond_kwargs = cond_value
+                with set_forward_context(
+                    current_timestep=step_indices[0],
+                    attn_metadata=steps[0].attn_metadata,
+                    forward_batch=reqs[0],
+                ):
+                    ctxs[0].cfg_policy.branches[0].configure_batch(reqs[0])
+                    raw = self._predict_noise(
+                        current_model=current_model,
+                        latent_model_input=batched_latent,
+                        timestep=batched_timestep,
+                        target_dtype=target_dtype,
+                        guidance=batched_guidance,
+                        **cond_kwargs,
+                    )
+                per_request_preds = self._split_batched_prediction(
+                    raw, len(ctxs), base_bs, [ctx.latents for ctx in ctxs], server_args
+                )
+
+        logger.info_once(
+            f"Continuous batching: fused {len(ctxs)} requests into one denoise "
+            f"step ({'CFG' if do_cfg else 'non-CFG'}; first occurrence, logged once)."
+        )
+        # Forward succeeded: from here on, advance each request's own scheduler.
+        for ctx, batch, step, noise_pred in zip(ctxs, reqs, steps, per_request_preds):
+            self._apply_scheduler_step(ctx, step, batch, server_args, noise_pred)
+            self._record_trajectory(ctx, step, batch, server_args)
+            if not ctx.is_warmup:
+                self.step_profile()
+        return True
+
     @torch.no_grad()
     def forward(
         self,
@@ -1602,6 +2063,36 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             server_args.pipeline_config,
             cfg_parallel=server_args.enable_cfg_parallel,
         )
+
+    def _split_batched_prediction(
+        self,
+        raw: "torch.Tensor | tuple[torch.Tensor, ...]",
+        n_branches: int,
+        base_bs: int,
+        latents: "torch.Tensor | list[torch.Tensor] | None",
+        server_args: ServerArgs,
+    ) -> "list[torch.Tensor | tuple[torch.Tensor, ...]]":
+        """Split a fused forward output back into per-branch predictions.
+
+        Mirrors the per-branch postprocessing of the sequential path: each
+        single-tensor prediction is run through ``slice_noise_pred`` so the
+        returned list is interchangeable with sequential branch outputs.
+
+        ``latents`` selects the slice reference: a single tensor (shared across
+        all branches, the batched-CFG path), a per-branch list (continuous
+        batching's per-request slicing), or ``None`` to skip slicing (when the
+        raw output is already sliced, e.g. inside ``_predict_noise_with_cfg``).
+        """
+        raw_t = _wrap(raw)
+        per_elem_chunks = [torch.split(t, base_bs, dim=0) for t in raw_t]
+        predictions: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
+        for bi in range(n_branches):
+            pred_t = tuple(chunks[bi] for chunks in per_elem_chunks)
+            if latents is not None and len(pred_t) == 1:
+                ref = latents[bi] if isinstance(latents, list) else latents
+                pred_t = (server_args.pipeline_config.slice_noise_pred(pred_t[0], ref),)
+            predictions.append(_unwrap(pred_t))
+        return predictions
 
     def _build_attn_metadata(
         self,

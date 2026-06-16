@@ -1016,3 +1016,86 @@ class ComposedPipelineBase(ABC):
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
+
+    # ------------------------------------------------------------------
+    # Continuous batching: split the pipeline around the denoising stage so a
+    # driver can run the pre-denoise stages, step the denoising loop externally,
+    # then run the post-denoise stages. See ``runtime/managers/
+    # diffusion_continuous_batching.py``.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cb_unwrap_denoising(stage: PipelineStage) -> DenoisingStage | None:
+        """Return the standard ``DenoisingStage`` driven by ``stage`` for CB.
+
+        A ``ProgressiveDenoisingStageRouter`` delegates ``fullres`` (default)
+        requests to a plain ``DenoisingStage`` (``standard_stage``); that inner
+        stage has the cb_* hooks and is what we drive. A bare progressive stage
+        has no standard fullres loop and is not CB-drivable.
+        """
+        if isinstance(stage, ProgressiveDenoisingStageRouter):
+            return stage.standard_stage
+        if isinstance(stage, ProgressiveDenoisingStage):
+            return None
+        if isinstance(stage, DenoisingStage):
+            return stage
+        return None
+
+    def get_denoising_stage(self) -> DenoisingStage | None:
+        """Return the single CB-drivable ``DenoisingStage`` in this pipeline."""
+        unwrapped = [
+            d for s in self.stages if (d := self._cb_unwrap_denoising(s)) is not None
+        ]
+        if len(unwrapped) == 1:
+            return unwrapped[0]
+        return None
+
+    def cb_split_stages(
+        self,
+    ) -> tuple[list[PipelineStage], DenoisingStage, list[PipelineStage]] | None:
+        """Return ``(pre_stages, denoising_stage, post_stages)`` or ``None``.
+
+        ``None`` means the pipeline cannot be driven step-by-step (no denoising
+        stage, more than one, or only a bare progressive-resolution stage).
+        ``denoising_stage`` is the unwrapped standard stage (a router stays in
+        ``pre``/``post`` boundaries via its position in ``self.stages``).
+        """
+        # The stage list is fixed after build, so memoize — this is called per
+        # queued request per denoise tick on the continuous-batching hot path.
+        cached = getattr(self, "_cb_split_cache", None)
+        if cached is not None:
+            return cached if cached is not False else None
+
+        denoising = self.get_denoising_stage()
+        if denoising is None:
+            self._cb_split_cache = False
+            return None
+        idx = None
+        for i, stage in enumerate(self.stages):
+            if self._cb_unwrap_denoising(stage) is denoising:
+                idx = i
+                break
+        if idx is None:
+            self._cb_split_cache = False
+            return None
+        result = (self.stages[:idx], denoising, self.stages[idx + 1 :])
+        self._cb_split_cache = result
+        return result
+
+    def cb_setup_residency(self, server_args: ServerArgs) -> None:
+        """Wire the component-residency manager exactly as ``forward`` does."""
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+
+    def cb_run_stages(
+        self,
+        stages: list[PipelineStage],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req | OutputBatch:
+        """Run a contiguous sub-list of stages through the profiling executor."""
+        if not stages:
+            return batch
+        return self.executor.execute_with_profiling(stages, batch, server_args)
