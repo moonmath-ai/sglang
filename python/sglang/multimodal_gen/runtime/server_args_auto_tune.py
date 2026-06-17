@@ -15,6 +15,8 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    is_image_encoder_component_name,
+    is_text_encoder_component_name,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -378,6 +380,18 @@ class ServerArgsAutoTuner:
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
             if not args.is_arg_explicitly_set(arg_name)
         ]
+        # Keep the encoders resident for CB (the VAE stays eligible — it is off the
+        # per-group critical path). Must use the SAME gate as _adjust_offload so
+        # layerwise and cpu-offload placement agree. See _cb_prefers_resident_encoders.
+        if args._cb_prefers_resident_encoders():
+            components = [
+                c
+                for c in components
+                if not (
+                    is_text_encoder_component_name(c)
+                    or is_image_encoder_component_name(c)
+                )
+            ]
         if self._should_auto_enable_dit_layerwise_offload():
             components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
             self._set_default_wan_dit_offload_prefetch_size()

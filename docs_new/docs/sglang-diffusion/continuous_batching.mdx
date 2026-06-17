@@ -1,0 +1,94 @@
+---
+title: "Continuous Batching"
+description: "Step-level continuous batching for the diffusion denoising loop."
+mode: wide
+---
+
+Step-level continuous batching for the diffusion denoising loop is an opt-in, single-device, **monolithic role only** feature (default OFF). 
+
+It inverts the synchronous scheduler control flow so several request *groups* denoise concurrently and advance one step per "tick". Groups admitted mid-flight join at the next step, and finish independently (e.g., a 20-step group returns while a 50-step one keeps going). The server remains responsive between steps.
+
+## Enable
+
+To enable continuous batching, start the server with the following CLI arguments:
+
+```bash Command
+sglang serve ... \
+  --enable-diffusion-continuous-batching \
+  [--diffusion-cb-max-running N] \
+  [--diffusion-cb-fuse-forward true|false] \
+  [--diffusion-cb-steps-per-tick K]
+```
+
+### Parameters
+
+- `--enable-diffusion-continuous-batching`: Enables step-level continuous batching.
+- `--diffusion-cb-max-running`: The maximum number of concurrent requests (group size). Engine `max_running` is calculated as `max(32, 4 * group_size)`.
+- `--diffusion-cb-fuse-forward`: Toggles model forward fusion (default true). If enabled, compatible groups have their denoise forwards fused.
+- `--diffusion-cb-steps-per-tick`: Amortization steps (default 3). Takes several denoise steps per event-loop iteration to reduce the round-trip overhead of step scheduling.
+
+---
+
+## How it Works
+
+### Merged Group Admission
+Each running unit is a **merged batch group**, not a single request. 
+1. The scheduler collects compatible eligible requests.
+2. It merges them into one batched request.
+3. The group is admitted to the engine with its list of client identities and original request parameters.
+4. The worker runs the **batched** pre-denoise stages (e.g., one T5 encode for all prompts in the group), steps the batched denoise loop, and runs the **batched** decode.
+5. The scheduler splits the batched output back to each client.
+
+This batched encode/denoise/decode is the core reason continuous batching matches dynamic batching throughput (reaching ~95% of dynamic batching compared to only ~40% without it).
+
+### Fused Forward
+The engine attempts to run a fused forward pass first (`cb_run_step_fused`). It packs a compatible group's scaled latents into a single batched model forward pass (sharing the forward pass even if requests are at different steps).
+* **Guarded by `cb_group_fusable`**: Fusion requires a single transformer, dense attention (no STA/VSA/SVG2), `cache-dit` off, no `TeaCache`, no `Wan-TI2V`, no active CFG gate, and cleanly mergeable conditioning arguments.
+* **Classifier-Free Guidance (CFG)**: Fused CFG branches run conditional/unconditional segments concurrently (via `--enable-batched-cfg` or multiple forwards) and split the outputs per request.
+* **Fallback**: Any compatibility mismatch drops down gracefully to per-request sequential steps.
+
+### Adaptive Admission Gate (`_cb_should_admit`)
+To prevent eager admission from triggering expensive text-encodes every tick, an adaptive gate is used. It accumulates requests into full groups unless:
+1. The engine is **idle** (allows low latency at low load).
+2. A **full group** is queued.
+3. The queue head has waited longer than `_cb_admission_delay_s` (default 100ms, overridden by `--batching-delay-ms`).
+
+---
+
+## Performance Results
+
+### 1. CB vs Dynamic Batching — FLUX.1-schnell 256×256, 4-step
+*1×H100 exclusive, resident weights (`--dit-cpu-offload false`), concurrency=16, 48 requests:*
+
+| config | req/s | p50 latency | vs dynamic |
+|---|---|---|---|
+| Baseline (no batching) | 2.49 | 6.41s | 27% |
+| **Dynamic batching** (`--batching-max-size 8 --batching-delay-ms 50`) | **9.08** | 1.74s | 100% |
+| **CB, fused** | **8.68** | 1.82s | **96%** |
+| CB, no fusion (`--diffusion-cb-fuse-forward false`) | 8.62 | 1.82s | 95% |
+
+### 2. When Fusion Helps (GPU Utilization Headroom)
+Fusion provides speedups when a single denoise forward under-utilizes the GPU:
+
+| Model / res | single-stream util | fusion speedup |
+|---|---|---|
+| Z-Image 256 | 51% | **1.58×** |
+| FLUX 256 | 76% | 1.28× |
+| FLUX 512 | 88% | 1.07× |
+| Z-Image 512 | 83% | ~0.95× |
+| Z-Image 768 | 96% | ~0.93× |
+| FLUX 1024 | 95% | 1.00× |
+
+### 3. Mixed Step Counts (Diverse Step Workloads)
+Dynamic batching requires identical step counts to merge requests, whereas CB fuses across different step progresses:
+
+* **Near-unique Steps** (distinct steps 10-41, concurrency=32):
+  * **Dynamic Batching**: 0.68 req/s (p50 long = 41.84s)
+  * **Continuous Batching**: **1.77 req/s** (p50 long = 17.84s) — **2.6× speedup**.
+
+---
+
+## Limitations & Fallback Pathways
+Continuous Batching defaults to the synchronous pathway for unsupported features, including:
+* Sequence parallelism, rollout, warmup, multi-GPU, and disaggregated serving.
+* Custom-loop denoising stages that override the base loop (e.g., LTX-2 joint audio+video, Hunyuan3D-shape).

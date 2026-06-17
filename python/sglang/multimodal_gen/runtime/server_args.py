@@ -193,8 +193,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # filename logic.
     component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
 
-    # Quantization method for online quantization
-    quantization: str | None = None
+
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
 
@@ -245,7 +244,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     disable_autocast: bool | None = None
 
-    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # Quantization method override (e.g., "mxfp8", "fp8", "modelslim") or online quantization method.
     # When set, the transformer loader will use this instead of auto-detection.
     quantization: str | None = None
 
@@ -271,6 +270,18 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+
+    # Step-level diffusion continuous batching: keep several requests denoising
+    # at once, admitting/finalizing them at step boundaries instead of running
+    # whole requests to completion one (merged) batch at a time.
+    enable_diffusion_continuous_batching: bool = False
+    diffusion_cb_max_running: int = 8
+    # Fuse compatible running requests' denoise step into one model forward
+    # (falls back to per-request stepping when a group cannot be fused).
+    diffusion_cb_fuse_forward: bool = True
+    # Denoise steps taken per event-loop iteration. Amortizes the per-step
+    # recv/admit round-trip; kept small so new arrivals are admitted promptly.
+    diffusion_cb_steps_per_tick: int = 3
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -448,10 +459,32 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.sp_degree,
             )
 
+    def _cb_prefers_resident_encoders(self) -> bool:
+        """Whether continuous batching should keep the text/image encoders resident.
+
+        CB runs the text-encode per admitted group on the denoise critical path, so
+        offloading the encoders (streaming weights every encode) is its dominant
+        overhead. Only applies on large cards and outside memory-first mode.
+        """
+        if not self.enable_diffusion_continuous_batching:
+            return False
+        if self.performance_mode == "memory":
+            return False
+        if current_platform.is_cpu():
+            return False
+        return current_platform.get_device_total_memory() / BYTES_PER_GB >= 48
+
     def _adjust_offload(self):
         if current_platform.is_cpu():
             # CPU platform does not need offload
             return
+
+        if self._cb_prefers_resident_encoders():
+            # Set before the branches below so the default-True logic is skipped.
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = False
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = False
 
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
@@ -1507,6 +1540,47 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--enable-diffusion-continuous-batching",
+            action="store_true",
+            default=ServerArgs.enable_diffusion_continuous_batching,
+            help=(
+                "Experimental: keep several requests denoising concurrently and "
+                "advance them one step at a time, so requests admitted mid-flight "
+                "join at the next step and finish independently. Falls back to the "
+                "standard path for requests the pipeline cannot step (rollout, "
+                "sequence parallelism, non-standard denoising stages)."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-cb-max-running",
+            type=int,
+            default=ServerArgs.diffusion_cb_max_running,
+            help=(
+                "Maximum number of requests denoising concurrently when "
+                "--enable-diffusion-continuous-batching is set."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-cb-fuse-forward",
+            action=StoreBoolean,
+            default=ServerArgs.diffusion_cb_fuse_forward,
+            help=(
+                "Fuse compatible continuous-batching requests' denoise step into "
+                "one model forward. Set --diffusion-cb-fuse-forward false to always "
+                "step per-request."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-cb-steps-per-tick",
+            type=int,
+            default=ServerArgs.diffusion_cb_steps_per_tick,
+            help=(
+                "Number of denoise steps taken per continuous-batching event-loop "
+                "iteration. Amortizes the per-step admission round-trip; kept small "
+                "so new arrivals are admitted promptly."
+            ),
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -2046,6 +2120,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.diffusion_cb_max_running < 1:
+            raise ValueError("diffusion_cb_max_running must be >= 1")
+        if self.diffusion_cb_steps_per_tick < 1:
+            raise ValueError("diffusion_cb_steps_per_tick must be >= 1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

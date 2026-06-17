@@ -208,6 +208,14 @@ class ProgressiveDenoisingStageRouter(PipelineStage):
     def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
         return self.standard_stage.component_uses(server_args, stage_name)
 
+    def cb_supports(self, batch: Req) -> tuple[bool, str | None]:
+        mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
+        if is_progressive_resolution_mode(mode):
+            return self._get_progressive_stage().cb_supports(batch)
+        if mode == "fullres":
+            return self.standard_stage.cb_supports(batch)
+        return False, f"Unsupported progressive_mode: {mode!r}"
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
         if is_progressive_resolution_mode(mode):

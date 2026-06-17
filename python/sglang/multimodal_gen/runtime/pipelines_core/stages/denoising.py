@@ -11,7 +11,7 @@ import os
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
 from typing import Any
 
@@ -1012,6 +1012,45 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         below; mirror them in the override if those markers are needed.
         """
         use_nvtx = self.current_use_nvtx
+        # 1-3. Build the scaled latent model input and the expanded timestep.
+        latent_model_input, timestep = self._build_forward_inputs(
+            ctx, step, batch, server_args
+        )
+
+        # 4. Run the model prediction path, including CFG when enabled.
+        with maybe_nvtx_range("predict_noise", use_nvtx):
+            noise_pred = self._predict_noise_with_cfg(
+                current_model=step.current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=step.step_index,
+                attn_metadata=step.attn_metadata,
+                target_dtype=ctx.target_dtype,
+                current_guidance_scale=step.current_guidance_scale,
+                cfg_policy=ctx.cfg_policy,
+                cfg_gate_state=ctx.extra.get("cfg_gate_state"),
+                server_args=server_args,
+                guidance=ctx.guidance,
+                latents=ctx.latents,
+            )
+
+        # 5-6. Advance the scheduler and re-apply model-specific constraints.
+        with maybe_nvtx_range("scheduler_step", use_nvtx):
+            self._apply_scheduler_step(ctx, step, batch, server_args, noise_pred)
+
+    def _build_forward_inputs(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> "tuple[torch.Tensor, Any]":
+        """Steps 1-3 of a denoising step: scaled latent input + expanded timestep.
+
+        Factored out of ``_run_denoising_step`` so the continuous-batching fused
+        path can build per-request inputs before concatenating them.
+        """
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
@@ -1036,36 +1075,32 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         latent_model_input = ctx.scheduler.scale_model_input(
             latent_model_input, step.t_device
         )
+        return latent_model_input, timestep
 
-        # 4. Run the model prediction path, including CFG when enabled.
-        with maybe_nvtx_range("predict_noise", use_nvtx):
-            noise_pred = self._predict_noise_with_cfg(
-                current_model=step.current_model,
-                latent_model_input=latent_model_input,
-                timestep=timestep,
-                batch=batch,
-                timestep_index=step.step_index,
-                attn_metadata=step.attn_metadata,
-                target_dtype=ctx.target_dtype,
-                current_guidance_scale=step.current_guidance_scale,
-                cfg_policy=ctx.cfg_policy,
-                cfg_gate_state=ctx.extra.get("cfg_gate_state"),
-                server_args=server_args,
-                guidance=ctx.guidance,
-                latents=ctx.latents,
-            )
+    def _apply_scheduler_step(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+        noise_pred: "torch.Tensor",
+    ) -> None:
+        """Steps 5-6 of a denoising step: scheduler update + TI2V constraints.
+
+        Uses this request's own ``ctx.scheduler`` and timestep, so it stays
+        correct when several requests at different steps share a fused forward.
+        """
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
 
         # 5. Advance the scheduler state with the predicted noise.
-        with maybe_nvtx_range("scheduler_step", use_nvtx):
-            ctx.latents = ctx.scheduler.step(
-                model_output=noise_pred,
-                timestep=step.t_device,
-                sample=ctx.latents,
-                **ctx.extra_step_kwargs,
-                return_dict=False,
-            )[0]
+        ctx.latents = ctx.scheduler.step(
+            model_output=noise_pred,
+            timestep=step.t_device,
+            sample=ctx.latents,
+            **ctx.extra_step_kwargs,
+            return_dict=False,
+        )[0]
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1290,6 +1325,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             current_model: the next active dit, transformer_1 or transformer_2
         """
         manager = self._component_residency_manager
+        if manager is None:
+            return
 
         component_name = manager.component_name_for_module(current_model, current_phase)
         phase = str(batch.extra.get("ltx2_phase", current_phase))
@@ -1361,6 +1398,114 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             latents = blend_wan_ti2v_latents(latents, reserved_frames_mask, z)
 
         return latents
+
+    # ------------------------------------------------------------------
+    # Step-level execution hooks for continuous batching. They split ``forward``'s
+    # denoising loop so an external driver can interleave one step at a time across
+    # concurrent requests, reusing the same per-step body (``_prepare_step_state``
+    # -> ``_run_denoising_step`` -> ``_record_trajectory``) as the monolithic path.
+    # ------------------------------------------------------------------
+
+    def cb_supports(self, batch: Req) -> tuple[bool, str | None]:
+        """Whether this request can be driven step-by-step. (reason if not)."""
+        # A subclass that overrides ``forward`` has a custom loop the base hooks
+        # don't reproduce (e.g. LTX-2's joint audio+video) — driving it stepwise
+        # would silently skip that work. Overriding only step *helpers* is fine.
+        if (getattr(batch, "progressive_mode", "fullres") or "fullres") != "fullres":
+            return (
+                False,
+                f"progressive resolution mode {batch.progressive_mode!r} is not "
+                "supported by continuous batching",
+            )
+
+        if type(self).forward is not DenoisingStage.forward:
+            return (
+                False,
+                f"{type(self).__name__} overrides the denoising loop "
+                "(unsupported by continuous batching)",
+            )
+        if batch.rollout:
+            return False, "rollout collection is not supported with continuous batching"
+        if self._sp_world_size() > 1:
+            return (
+                False,
+                "sequence parallelism is not supported with continuous batching",
+            )
+        return True, None
+
+    @torch.no_grad()
+    def cb_begin(self, batch: Req, server_args: ServerArgs) -> DenoisingContext:
+        """Prepare denoising state for stepwise execution (mirrors ``forward`` setup)."""
+        supported, reason = self.cb_supports(batch)
+        if not supported:
+            raise NotImplementedError(reason)
+        ctx = self._prepare_denoising_loop(batch, server_args)
+        self._before_denoising_loop(ctx, batch, server_args)
+        # Cache the loop-invariant CPU timesteps and the resolved nvtx gate so
+        # every subsequent ``cb_run_step`` reuses them instead of recomputing.
+        ctx.extra["cb_timesteps_cpu"] = ctx.timesteps.cpu()
+        ctx.extra["cb_num_timesteps"] = ctx.extra["cb_timesteps_cpu"].shape[0]
+        ctx.extra["cb_use_nvtx"] = self._apply_nvtx_gate(ctx.is_warmup)
+        ctx.extra["cb_start_time"] = time.time()
+        return ctx
+
+    def cb_num_steps(self, ctx: DenoisingContext) -> int:
+        return int(ctx.extra["cb_num_timesteps"])
+
+    @torch.no_grad()
+    def cb_run_step(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+    ) -> None:
+        """Run exactly one denoising step (the body of ``forward``'s loop)."""
+        timesteps_cpu = ctx.extra["cb_timesteps_cpu"]
+        t_host = timesteps_cpu[step_index]
+        use_nvtx = ctx.extra["cb_use_nvtx"]
+        self._current_use_nvtx = use_nvtx
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=ctx.target_dtype,
+                enabled=ctx.autocast_enabled,
+            ),
+            maybe_nvtx_range(
+                f"denoising_step_{step_index}_t{t_host.item():.4g}", use_nvtx
+            ),
+            StageProfiler(
+                f"denoising_step_{step_index}",
+                logger=logger,
+                metrics=batch.metrics,
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+                record_as_step=True,
+            ),
+        ):
+            step = self._prepare_step_state(
+                ctx, batch, server_args, step_index, t_host, timesteps_cpu
+            )
+            self._run_denoising_step(ctx, step, batch, server_args)
+            self._record_trajectory(ctx, step, batch, server_args)
+            if not ctx.is_warmup:
+                self.step_profile()
+
+    @torch.no_grad()
+    def cb_end(self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs) -> Req:
+        """Finalize the denoising loop after the last step (mirrors ``forward`` tail)."""
+        num_timesteps = self.cb_num_steps(ctx)
+        if num_timesteps > 0 and not ctx.is_warmup:
+            elapsed = time.time() - ctx.extra.get("cb_start_time", time.time())
+            self.log_info(
+                "average time per step: %.4f seconds", elapsed / num_timesteps
+            )
+        self._finish_active_component_use()
+        self._finalize_denoising_loop(ctx, batch, server_args)
+        return batch
+
+    # ------------------------------------------------------------------
+    # Step-level continuous batching logic (mirrors ``forward`` loop body)
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def forward(
@@ -1629,6 +1774,36 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             server_args.pipeline_config,
             cfg_parallel=server_args.enable_cfg_parallel,
         )
+
+    def _split_batched_prediction(
+        self,
+        raw: "torch.Tensor | tuple[torch.Tensor, ...]",
+        n_branches: int,
+        base_bs: int,
+        latents: "torch.Tensor | list[torch.Tensor] | None",
+        server_args: ServerArgs,
+    ) -> "list[torch.Tensor | tuple[torch.Tensor, ...]]":
+        """Split a fused forward output back into per-branch predictions.
+
+        Mirrors the per-branch postprocessing of the sequential path: each
+        single-tensor prediction is run through ``slice_noise_pred`` so the
+        returned list is interchangeable with sequential branch outputs.
+
+        ``latents`` selects the slice reference: a single tensor (shared across
+        all branches, the batched-CFG path), a per-branch list (continuous
+        batching's per-request slicing), or ``None`` to skip slicing (when the
+        raw output is already sliced, e.g. inside ``_predict_noise_with_cfg``).
+        """
+        raw_t = _wrap(raw)
+        per_elem_chunks = [torch.split(t, base_bs, dim=0) for t in raw_t]
+        predictions: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
+        for bi in range(n_branches):
+            pred_t = tuple(chunks[bi] for chunks in per_elem_chunks)
+            if latents is not None and len(pred_t) == 1:
+                ref = latents[bi] if isinstance(latents, list) else latents
+                pred_t = (server_args.pipeline_config.slice_noise_pred(pred_t[0], ref),)
+            predictions.append(_unwrap(pred_t))
+        return predictions
 
     def _build_attn_metadata(
         self,

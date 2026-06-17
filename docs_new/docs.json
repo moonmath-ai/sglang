@@ -1256,6 +1256,8 @@
                     "root": "docs/sglang-diffusion/caching-acceleration",
                     "tag": "approx",
                     "pages": [
+                      "docs/sglang-diffusion/dynamic_batching",
+                      "docs/sglang-diffusion/continuous_batching",
                       "docs/sglang-diffusion/cache_dit",
                       "docs/sglang-diffusion/teacache"
                     ]

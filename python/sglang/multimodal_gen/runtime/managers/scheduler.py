@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.ipc_array import (
     spill_large_arrays_to_file_refs,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
+from sglang.multimodal_gen.runtime.managers.diffusion_continuous_batching import (
+    ContinuousBatchingEngine,
+)
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
@@ -163,6 +166,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._consecutive_error_count = 0
 
         self._init_disagg_state(server_args, local_rank)
+
+        self._cb_engine = self._maybe_init_cb_engine(server_args)
 
         if self._batch_metrics_enabled:
             logger.info(
@@ -734,6 +739,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         return outputs
 
+    def _wait_for_queue_accumulation(self) -> None:
+        """Wait for more results to accumulate in the queue based on batching delay."""
+        if not self.waiting_queue or self.receiver is None:
+            return
+
+        oldest_ts = self.waiting_queue[0][2]
+        elapsed_s = time.monotonic() - oldest_ts
+        remaining_ms = max(0.0, (self._batching_delay_s - elapsed_s) * 1000.0)
+
+        if remaining_ms > 0:
+            self._poller.poll(timeout=remaining_ms)
+
     def _dynamic_batching_enabled(self) -> bool:
         """Return whether this server and pipeline can use dynamic batching.
 
@@ -933,6 +950,263 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         return recv_reqs
 
+    # ------------------------------------------------------------------
+    # Step-level continuous batching
+    # ------------------------------------------------------------------
+
+    def _maybe_init_cb_engine(
+        self, server_args: ServerArgs
+    ) -> ContinuousBatchingEngine | None:
+        """Create the continuous-batching engine when enabled and supported."""
+        if not server_args.enable_diffusion_continuous_batching:
+            return None
+        if self._disagg_role != RoleType.MONOLITHIC:
+            logger.warning(
+                "Continuous batching is not supported in disaggregated mode; "
+                "falling back to the standard scheduler path."
+            )
+            return None
+        single_device = (
+            server_args.num_gpus == 1
+            and server_args.tp_size == 1
+            and server_args.ulysses_degree == 1
+            and server_args.ring_degree == 1
+        )
+        if not single_device:
+            logger.warning(
+                "Continuous batching is currently single-device only; falling back "
+                "to the standard scheduler path."
+            )
+            return None
+        # Up to this many compatible requests are merged into one batch group, so
+        # encode/denoise/decode are all batched (like dynamic batching).
+        self._cb_group_size = server_args.diffusion_cb_max_running
+        # Let the queue accumulate into a fuller group before encoding (see
+        # _cb_should_admit); the wait overlaps running groups' denoise steps.
+        self._cb_admission_delay_s = (
+            self._batching_delay_s if self._batching_delay_s > 0 else 0.1
+        )
+        # Keep several groups in flight.
+        max_running = max(32, server_args.diffusion_cb_max_running * 4)
+        max_batch_size = server_args.diffusion_cb_max_running * 2
+        logger.info(
+            "Diffusion continuous batching enabled (group_size=%d, max_running=%d).",
+            self._cb_group_size,
+            max_running,
+        )
+        return ContinuousBatchingEngine(
+            self.worker,
+            max_running=max_running,
+            max_batch_size=max_batch_size,
+        )
+
+    @property
+    def _cb_enabled(self) -> bool:
+        return self._cb_engine is not None
+
+    def _cb_eligible(self, req: Any) -> bool:
+        """Whether ``req`` should be served by the continuous-batching engine.
+
+        Cached on the req: eligibility is fixed for a request, and this is called
+        for every queued request on every denoise tick (admission scan).
+        """
+        if not isinstance(req, Req):
+            return False
+        cached = getattr(req, "_cb_eligible_cache", None)
+        if cached is not None:
+            return cached
+        if req.is_warmup:
+            # Preserve warmup semantics on the synchronous path.
+            result = False
+        else:
+            can_run, _reason = self.worker.cb_can_run(req)
+            result = can_run
+        req._cb_eligible_cache = result
+        return result
+
+    def _cb_should_admit(self) -> bool:
+        """Whether to admit a new group now, or let the queue accumulate.
+
+        Admit when: the engine is idle (don't waste the GPU), a full group is
+        already queued, or the oldest eligible request has waited the admission
+        delay. Otherwise hold off so the queue grows into a fuller group and the
+        text-encode is amortized — the wait overlaps with the running groups'
+        denoise steps, so it is not idle latency.
+        """
+        head_req = None
+        head_ts = None
+        n_compatible = 0
+        for _identity, req, ts in self.waiting_queue:
+            if not self._cb_eligible(req):
+                continue
+            if head_req is None:
+                head_req, head_ts = req, ts
+                n_compatible = 1
+            elif self._can_dynamic_batch(head_req, req):
+                n_compatible += 1
+        if head_req is None:
+            return False
+        if not self._cb_engine.has_work():
+            return True
+        if n_compatible >= self._cb_group_size:
+            return True
+        return (time.monotonic() - head_ts) >= self._cb_admission_delay_s
+
+    def _cb_collect_group(self) -> list[tuple[bytes | None, Req]]:
+        """Pull one compatible group of eligible Reqs out of the waiting queue.
+
+        Finds the first CB-eligible request, then gathers subsequent eligible
+        requests that are dynamic-batch-compatible with it, up to the group size
+        and the engine's remaining headroom. Removes them from the queue.
+        """
+        cap = min(self._cb_group_size, self._cb_engine.admit_headroom())
+        if cap < 1:
+            return []
+        head_idx = None
+        for i in range(len(self.waiting_queue)):
+            if self._cb_eligible(self.waiting_queue[i][1]):
+                head_idx = i
+                break
+        if head_idx is None:
+            return []
+        head_identity, head_req, _ = self.waiting_queue[head_idx]
+        group: list[tuple[bytes | None, Req]] = [(head_identity, head_req)]
+        indices = [head_idx]
+        for i in range(head_idx + 1, len(self.waiting_queue)):
+            if len(group) >= cap:
+                break
+            identity, req, _ = self.waiting_queue[i]
+            if self._cb_eligible(req) and self._can_dynamic_batch(head_req, req):
+                group.append((identity, req))
+                indices.append(i)
+        for i in sorted(indices, reverse=True):
+            del self.waiting_queue[i]
+        return group
+
+    def _cb_admit_from_queue(self) -> list[tuple[Any, OutputBatch]]:
+        """Admit compatible groups of eligible Reqs into the engine.
+
+        Returns immediate ``(state, OutputBatch)`` results for groups whose
+        preparation failed or that had nothing to denoise.
+        """
+        immediate: list[tuple[Any, OutputBatch]] = []
+        while self._cb_engine.admit_headroom() > 0 and self._cb_should_admit():
+            group = self._cb_collect_group()
+            if not group:
+                break
+            identities = [identity for identity, _req in group]
+            reqs = [req for _identity, req in group]
+            merged_req = (
+                self._try_merge_generation_reqs(reqs) if len(reqs) > 1 else reqs[0]
+            )
+            assert merged_req is not None
+            result = self._cb_engine.admit(identities, reqs, merged_req)
+            if result is not None:
+                immediate.append(result)
+        return immediate
+
+    def _cb_split_for_identities(
+        self, state: Any, output_batch: OutputBatch
+    ) -> list[OutputBatch]:
+        """Split a group's batched output back to one OutputBatch per identity."""
+        n = len(state.identities)
+        if output_batch.error is not None:
+            return [OutputBatch(error=output_batch.error) for _ in range(n)]
+        if n == 1:
+            return [output_batch]
+        split = self._split_batched_output(output_batch, state.original_reqs)
+        if split is None or len(split) != n:
+            logger.error(
+                "Continuous batching: failed to split batched output for %d "
+                "requests; returning errors.",
+                n,
+            )
+            return [
+                OutputBatch(error="continuous batching: could not split batched output")
+                for _ in range(n)
+            ]
+        return split
+
+    def _cb_return_finished(self, results: list[tuple[Any, OutputBatch]]) -> None:
+        """Split each finished group's output and reply to every client."""
+        for state, output_batch in results:
+            split_outputs = self._cb_split_for_identities(state, output_batch)
+            for identity, ob in zip(state.identities, split_outputs):
+                try:
+                    self.return_result(ob, identity, should_not_return=False)
+                except zmq.ZMQError as e:
+                    logger.error(f"ZMQ error sending reply: {e}")
+
+    def _execute_and_return_items(self, items: list[tuple[bytes | None, Any]]) -> None:
+        """Run a dispatched batch synchronously and reply to each request."""
+        try:
+            handler_result = self._dispatch_items(items)
+        except Exception as e:
+            logger.error(
+                f"Error executing request in scheduler event loop: {e}",
+                exc_info=True,
+            )
+            handler_result = OutputBatch(error=str(e))
+
+        if isinstance(handler_result, list):
+            output_batches = handler_result
+        else:
+            output_batches = [handler_result]
+
+        if len(output_batches) != len(items):
+            logger.error(
+                "Handler returned %d output(s) for %d request(s). Returning error "
+                "for unmatched requests.",
+                len(output_batches),
+                len(items),
+            )
+            output_batches = [
+                OutputBatch(
+                    error=(
+                        f"Internal scheduler error: expected {len(items)} outputs, "
+                        f"got {len(output_batches)}."
+                    )
+                )
+                for _ in items
+            ]
+
+        for (identity, processed_req), output_batch in zip(
+            items, output_batches, strict=True
+        ):
+            is_warmup = is_warmup_req(processed_req)
+            self._log_warmup_result(output_batch, processed_req, is_warmup)
+            if is_warmup and should_return_warmup_result(processed_req):
+                output_batch.drop_payload_for_warmup()
+                self.return_result(output_batch, identity, should_not_return=False)
+            else:
+                self.return_result(output_batch, identity, should_not_return=is_warmup)
+
+    def _cb_event_loop_iteration(self) -> None:
+        """Drive one continuous-batching tick (admit, dispatch ineligible, step)."""
+        # Admit eligible queued groups and reply to any immediate results.
+        immediate = self._cb_admit_from_queue()
+        if immediate:
+            self._cb_return_finished(immediate)
+
+        if not self._cb_engine.has_work():
+            # Only ineligible items (warmup / grouped multi-output) or an empty
+            # queue: drain a synchronous batch or wait for input.
+            items = self.get_next_batch_to_run()
+            if items:
+                try:
+                    self._execute_and_return_items(items)
+                except zmq.ZMQError as e:
+                    logger.error(f"ZMQ error sending reply: {e}")
+            elif self.waiting_queue:
+                self._wait_for_queue_accumulation()
+            elif self.receiver is not None:
+                self._poller.poll(timeout=1000.0)
+            return
+
+        # Take a few denoise steps per tick to amortize the recv/admit round-trip,
+        # but break early to admit a freshly-ready group or when the engine drains.
+        self._cb_return_finished(self._cb_engine.step())
+
     def event_loop(self) -> None:
         """
         The main event loop that listens for ZMQ requests.
@@ -980,67 +1254,20 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     ) from e
                 continue
 
+            # 2: continuous batching drives its own admit/step/finalize tick.
+            if self._cb_enabled:
+                self._cb_event_loop_iteration()
+                continue
+
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
-                if self.waiting_queue and self._dynamic_batching_enabled():
-                    oldest_ts = self.waiting_queue[0][2]
-                    elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
-                    remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
-                    if remaining_ms > 0 and self.receiver is not None:
-                        self._poller.poll(timeout=remaining_ms)
-                    elif remaining_ms > 0:
-                        time.sleep(remaining_ms / 1000.0)
+                self._wait_for_queue_accumulation()
                 continue
 
+            # execute the dispatched batch and reply to each request
             try:
-                handler_result = self._dispatch_items(items)
-            except Exception as e:
-                logger.error(
-                    f"Error executing request in scheduler event loop: {e}",
-                    exc_info=True,
-                )
-                handler_result = OutputBatch(error=str(e))
-
-            if isinstance(handler_result, list):
-                output_batches = handler_result
-            else:
-                output_batches = [handler_result]
-
-            if len(output_batches) != len(items):
-                logger.error(
-                    "Handler returned %d output(s) for %d request(s). Returning error for unmatched requests.",
-                    len(output_batches),
-                    len(items),
-                )
-                output_batches = [
-                    OutputBatch(
-                        error=(
-                            f"Internal scheduler error: expected {len(items)} outputs, "
-                            f"got {len(output_batches)}."
-                        )
-                    )
-                    for _ in items
-                ]
-
-            # 3. return results
-            try:
-                for (identity, processed_req), output_batch in zip(
-                    items, output_batches, strict=True
-                ):
-                    is_warmup = is_warmup_req(processed_req)
-                    self._log_warmup_result(output_batch, processed_req, is_warmup)
-
-                    if is_warmup and should_return_warmup_result(processed_req):
-                        # only keep the necessary lightweight payloads
-                        output_batch.drop_payload_for_warmup()
-                        self.return_result(
-                            output_batch, identity, should_not_return=False
-                        )
-                    else:
-                        self.return_result(
-                            output_batch, identity, should_not_return=is_warmup
-                        )
+                self._execute_and_return_items(items)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
