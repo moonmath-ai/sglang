@@ -1,0 +1,10 @@
+{
+  "quantization_config": {
+    "quant_method": "litelinear",
+    "checkpoint_format": "dense",
+    "rank": 64,
+    "target_patterns": [
+      "transformer_blocks\\..*(audio_)?ff\\.proj_(in|out)$"
+    ]
+  }
+}

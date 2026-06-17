@@ -52,6 +52,7 @@ class RequestMetrics:
         self.request_id = request_id
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
+        self.transformer_forward_steps: list[float] = []
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
@@ -73,6 +74,10 @@ class RequestMetrics:
             return
         self.steps.append(duration_s * 1000)
 
+    def record_transformer_forward_step(self, duration_s: float):
+        """Records transformer forward time for one denoising step."""
+        self.transformer_forward_steps.append(duration_s * 1000)
+
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
         if self.suppress_stage_breakdown:
             return
@@ -84,6 +89,7 @@ class RequestMetrics:
             "request_id": self.request_id,
             "stages": self.stages,
             "steps": self.steps,
+            "transformer_forward_steps": self.transformer_forward_steps,
             "total_duration_ms": self.total_duration_ms,
             "memory_snapshots": {
                 name: snapshot.to_dict()
@@ -310,6 +316,11 @@ class PerformanceLogger:
             for idx, duration_ms in enumerate(metrics.steps)
         ]
 
+        transformer_forward_steps_ms = [
+            {"step": idx, "duration_ms": duration_ms}
+            for idx, duration_ms in enumerate(metrics.transformer_forward_steps)
+        ]
+
         memory_checkpoints = {
             name: snapshot.to_dict()
             for name, snapshot in metrics.memory_snapshots.items()
@@ -323,6 +334,7 @@ class PerformanceLogger:
             "total_duration_ms": metrics.total_duration_ms,
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
+            "transformer_forward_steps_ms": transformer_forward_steps_ms,
             "memory_checkpoints": memory_checkpoints,
             "meta": meta or {},
         }

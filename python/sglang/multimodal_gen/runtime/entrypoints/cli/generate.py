@@ -127,6 +127,9 @@ def maybe_dump_performance(
     metrics = RequestMetrics(request_id=metrics_dict.get("request_id"))
     metrics.stages = metrics_dict.get("stages", {})
     metrics.steps = metrics_dict.get("steps", [])
+    metrics.transformer_forward_steps = metrics_dict.get(
+        "transformer_forward_steps", []
+    )
     metrics.total_duration_ms = metrics_dict.get("total_duration_ms", 0)
 
     # restore memory snapshots from serialized dict
@@ -177,6 +180,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
     _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
+    if getattr(args, "perf_dump_path", None):
+        sampling_params_kwargs["perf_dump_path"] = args.perf_dump_path
 
     # Handle diffusers-specific kwargs passed via CLI
     if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:

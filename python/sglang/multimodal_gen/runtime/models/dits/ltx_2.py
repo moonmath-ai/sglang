@@ -788,6 +788,7 @@ class LTX2FeedForward(nn.Module):
         dim: int,
         dim_out: int | None = None,
         mult: int = 4,
+        prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
@@ -796,7 +797,12 @@ class LTX2FeedForward(nn.Module):
         inner_dim = int(dim * mult)
 
         self.proj_in = ColumnParallelLinear(
-            dim, inner_dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            inner_dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_in" if prefix else "proj_in",
         )
         self.act = nn.GELU(approximate="tanh")
         self.proj_out = RowParallelLinear(
@@ -805,6 +811,7 @@ class LTX2FeedForward(nn.Module):
             bias=True,
             input_is_parallel=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.proj_out" if prefix else "proj_out",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -930,9 +937,17 @@ class LTX2TransformerBlock(nn.Module):
         )
 
         # 4. Feedforward layers
-        self.ff = LTX2FeedForward(dim, dim_out=dim, quant_config=quant_config)
+        self.ff = LTX2FeedForward(
+            dim,
+            dim_out=dim,
+            prefix=f"{prefix}.ff",
+            quant_config=quant_config,
+        )
         self.audio_ff = LTX2FeedForward(
-            audio_dim, dim_out=audio_dim, quant_config=quant_config
+            audio_dim,
+            dim_out=audio_dim,
+            prefix=f"{prefix}.audio_ff",
+            quant_config=quant_config,
         )
 
         # 5. Modulation Parameters
@@ -1527,7 +1542,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         getattr(arch, "force_sdpa_v2a_cross_attention", False)
                     ),
                     supported_attention_backends=self._supported_attention_backends,
-                    prefix=config.prefix,
+                    prefix=f"transformer_blocks.{idx}",
                     quant_config=quant_config,
                 )
                 for idx in range(arch.num_layers)
