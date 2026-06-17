@@ -796,6 +796,18 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
 
         return outputs
 
+    def _wait_for_queue_accumulation(self) -> None:
+        """Wait for more results to accumulate in the queue based on batching delay."""
+        if not self.waiting_queue or self.receiver is None:
+            return
+
+        oldest_ts = self.waiting_queue[0][2]
+        elapsed_s = time.monotonic() - oldest_ts
+        remaining_ms = max(0.0, (self._batching_delay_s - elapsed_s) * 1000.0)
+
+        if remaining_ms > 0:
+            self._poller.poll(timeout=remaining_ms)
+
     def _dynamic_batching_enabled(self) -> bool:
         """Return whether this server and pipeline can use dynamic batching.
 
@@ -1117,17 +1129,13 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         self._cb_admission_delay_s = (
             self._batching_delay_s if self._batching_delay_s > 0 else 0.1
         )
-        self._cb_steps_per_tick = server_args.diffusion_cb_steps_per_tick
-        # Keep several groups in flight, and let a denoise forward fuse a couple of
-        # groups together (encode/decode stay batched at group size).
+        # Keep several groups in flight.
         max_running = max(32, server_args.diffusion_cb_max_running * 4)
         max_batch_size = server_args.diffusion_cb_max_running * 2
         logger.info(
-            "Diffusion continuous batching enabled (group_size=%d, max_running=%d, "
-            "fused_forward_cap=%d).",
+            "Diffusion continuous batching enabled (group_size=%d, max_running=%d).",
             self._cb_group_size,
             max_running,
-            max_batch_size,
         )
         return ContinuousBatchingEngine(
             self.worker,
@@ -1234,9 +1242,7 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
             merged_req = (
                 self._try_merge_generation_reqs(reqs) if len(reqs) > 1 else reqs[0]
             )
-            if merged_req is None:
-                # Incompatible despite the compatibility check — admit head alone.
-                identities, reqs, merged_req = identities[:1], reqs[:1], reqs[0]
+            assert merged_req is not None
             result = self._cb_engine.admit(identities, reqs, merged_req)
             if result is not None:
                 immediate.append(result)
@@ -1335,18 +1341,14 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending reply: {e}")
             elif self.waiting_queue:
-                if self.receiver is not None:
-                    self._poller.poll(timeout=self._batching_delay_s * 1000.0 or 1.0)
+                self._wait_for_queue_accumulation()
             elif self.receiver is not None:
                 self._poller.poll(timeout=1000.0)
             return
 
         # Take a few denoise steps per tick to amortize the recv/admit round-trip,
         # but break early to admit a freshly-ready group or when the engine drains.
-        for _ in range(self._cb_steps_per_tick):
-            self._cb_return_finished(self._cb_engine.step())
-            if not self._cb_engine.has_work() or self._cb_should_admit():
-                break
+        self._cb_return_finished(self._cb_engine.step())
 
     def event_loop(self) -> None:
         """
@@ -1403,14 +1405,7 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
-                if self.waiting_queue and self._dynamic_batching_enabled():
-                    oldest_ts = self.waiting_queue[0][2]
-                    elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
-                    remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
-                    if remaining_ms > 0 and self.receiver is not None:
-                        self._poller.poll(timeout=remaining_ms)
-                    elif remaining_ms > 0:
-                        time.sleep(remaining_ms / 1000.0)
+                self._wait_for_queue_accumulation()
                 continue
 
             # execute the dispatched batch and reply to each request

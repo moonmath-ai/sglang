@@ -553,9 +553,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         assert self.pipeline is not None
         if self.pipeline.cb_split_stages() is None:
             return False, "pipeline does not expose a single standard denoising stage"
-        mode = getattr(req, "progressive_mode", "fullres") or "fullres"
-        if mode != "fullres":
-            return False, f"progressive resolution mode {mode!r} is not supported"
         denoising = self.pipeline.get_denoising_stage()
         return denoising.cb_supports(req)
 
@@ -647,31 +644,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not active:
             return
         with current_platform.inference_mode():
-            # Try to fuse the group's denoise step into one model forward.
-            # cb_run_step_fused mutates nothing before the forward, so a False
-            # return or a (pre-mutation) forward exception is a safe fallback.
-            if self.server_args.diffusion_cb_fuse_forward and len(active) >= 2:
-                try:
-                    fused = denoising.cb_run_step_fused(
-                        [s.ctx for s in active],
-                        [s.req for s in active],
-                        [s.step_index for s in active],
-                        self.server_args,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Continuous batching fused step raised; falling back to "
-                        "per-request stepping for this group. %s",
-                        e,
-                        exc_info=True,
-                    )
-                    fused = False
-                if fused:
-                    for state in active:
-                        state.step_index += 1
-                    return
-
-            # Step each request individually (also the fused-path fallback).
+            # Step each request individually.
             for state in active:
                 try:
                     denoising.cb_run_step(

@@ -1223,7 +1223,8 @@
                   {
                     "group": "Inference Batching",
                     "pages": [
-                      "docs/sglang-diffusion/dynamic_batching"
+                      "docs/sglang-diffusion/dynamic_batching",
+                      "docs/sglang-diffusion/continuous_batching"
                     ]
                   },
                   "docs/sglang-diffusion/profiling",
