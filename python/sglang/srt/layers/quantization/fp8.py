@@ -56,6 +56,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
+    can_auto_enable_marlin_mxfp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
@@ -67,7 +68,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_fp8_layer_for_marlin,
+    prepare_moe_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -212,7 +216,7 @@ class Fp8Config(QuantizationConfig):
         if _is_musa:
             return 31
 
-        return 100 if self.use_mxfp8 else 80
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -342,24 +346,28 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
         if _is_cuda:
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
-            auto_enable = can_auto_enable_marlin_fp8()
+            auto_enable = (
+                can_auto_enable_marlin_mxfp8()
+                if self.use_mxfp8
+                else can_auto_enable_marlin_fp8()
+            )
             self.use_marlin = force_marlin or auto_enable
 
-        self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
-        if self.use_mxfp8:
+        if self.use_mxfp8 and not self.use_marlin:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
-        else:
+        elif not self.use_mxfp8:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
@@ -870,6 +878,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
+    def _should_use_mxfp8_marlin(self) -> bool:
+        if not self.use_mxfp8:
+            return False
+        moe_runner_backend = get_moe_runner_backend()
+        return moe_runner_backend.is_marlin() or (
+            moe_runner_backend.is_auto() and can_auto_enable_marlin_mxfp8()
+        )
+
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
@@ -1379,6 +1395,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
+        if self._should_use_mxfp8_marlin():
+            self._process_mxfp8_moe_weights_for_marlin(layer, quantize)
+            return
+
         if not (_is_cuda and is_sm100_supported()):
             raise RuntimeError("MXFP8 MoE quantization requires SM100.")
 
@@ -1555,6 +1575,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
+    def _process_mxfp8_moe_weights_for_marlin(
+        self, layer: Module, quantize: bool = True
+    ) -> None:
+        def _quantize_for_marlin(weight: torch.Tensor):
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+            qweight, scale = mxfp8_group_quantize(weight.view(-1, k))
+            return qweight.view_as(weight), scale.view(num_experts, m, k // 32)
+
+        if quantize:
+            w13_q, w13_s = _quantize_for_marlin(layer.w13_weight.data)
+            w2_q, w2_s = _quantize_for_marlin(layer.w2_weight.data)
+        else:
+            w13_q = layer.w13_weight.data
+            w2_q = layer.w2_weight.data
+            w13_s = layer.w13_weight_scale_inv.data
+            w2_s = layer.w2_weight_scale_inv.data
+
+        copy_or_rebind_param(layer, "w13_weight", w13_q)
+        copy_or_rebind_param(layer, "w2_weight", w2_q)
+        copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_s)
+        copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_s)
+        layer.w13_weight_scale_inv.format_ue8m0 = True
+        layer.w2_weight_scale_inv.format_ue8m0 = True
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        layer.weight_block_size = self.quant_config.weight_block_size
+
+        prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -1686,7 +1737,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            weight_dtype = (
+                torch.float8_e4m3fn
+                if self._should_use_mxfp8_marlin()
+                else layer.w13_weight.dtype
+            )
+            layer.dispatcher.set_quant_config({"weight_dtype": weight_dtype})
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
@@ -1770,6 +1826,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif self.use_mxfp8 and can_auto_enable_marlin_mxfp8():
+                moe_runner_backend = MoeRunnerBackend.MARLIN
             elif (
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
@@ -1783,6 +1841,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
+            or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
@@ -1937,6 +1996,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 enable_es=(use_mxfp8, use_mxfp8),
             )
             return StandardCombineInput(hidden_states=output)
+
+        if self.runner.runner_backend.is_marlin():
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            expert_map = None
+            global_num_experts = -1
+            if hasattr(layer, "dispatcher") and hasattr(
+                layer.dispatcher, "local_expert_mapping"
+            ):
+                expert_map = layer.dispatcher.local_expert_mapping
+                if expert_map is not None:
+                    global_num_experts = self.moe_runner_config.num_experts
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=8,
+                is_fp8_weight=True,
+                is_k_full=True,
+                expert_map=expert_map,
+                global_num_experts=global_num_experts,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self.runner.runner_backend.is_deep_gemm():
 

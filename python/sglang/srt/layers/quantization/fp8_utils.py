@@ -1832,6 +1832,15 @@ def can_auto_enable_marlin_fp8() -> bool:
         return False
 
 
+def can_auto_enable_marlin_mxfp8() -> bool:
+    try:
+        major, minor = get_device_capability()
+        sm = major * 10 + minor
+        return 80 <= sm < 100
+    except Exception:
+        return False
+
+
 def apply_fp8_ptpc_linear(
     input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     weight: torch.Tensor,

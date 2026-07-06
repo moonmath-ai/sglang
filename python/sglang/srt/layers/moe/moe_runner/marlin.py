@@ -70,6 +70,7 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w2_qzeros: Optional[torch.Tensor] = None
 
     # Optional
+    is_fp8_weight: bool = False
     expert_map: Optional[torch.Tensor] = None
     global_num_experts: int = -1
     w13_global_scale: Optional[torch.Tensor] = None
@@ -149,6 +150,7 @@ def fused_experts_none_to_marlin(
         workspace=MARLIN_MOE_WORKSPACE,
         num_bits=quant_info.weight_bits,
         is_k_full=quant_info.is_k_full,
+        is_fp8_weight=quant_info.is_fp8_weight,
         inplace=marlin_inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,
         clamp_limit=(

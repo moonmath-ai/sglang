@@ -20,9 +20,12 @@ def get_scalar_type(
     has_zp: bool,
     scales: Optional[torch.Tensor] = None,
     global_scale: Optional[torch.Tensor] = None,
+    is_fp8_weight: bool = False,
 ):
     from sgl_kernel.scalar_type import scalar_types
 
+    if not has_zp and num_bits == 8 and is_fp8_weight:
+        return scalar_types.float8_e4m3fn
     if (
         not has_zp
         and num_bits == 4
@@ -90,6 +93,7 @@ def fused_marlin_moe(
     workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
+    is_fp8_weight: bool = False,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
     clamp_limit: Optional[float] = None,
@@ -193,10 +197,18 @@ def fused_marlin_moe(
         )
 
     scalar_type1 = get_scalar_type(
-        num_bits, w1_zeros is not None, w1_scale, w1_global_scale
+        num_bits,
+        w1_zeros is not None,
+        w1_scale,
+        w1_global_scale,
+        is_fp8_weight,
     )
     scalar_type2 = get_scalar_type(
-        num_bits, w2_zeros is not None, w2_scale, w2_global_scale
+        num_bits,
+        w2_zeros is not None,
+        w2_scale,
+        w2_global_scale,
+        is_fp8_weight,
     )
 
     intermediate_cache2 = torch.empty(

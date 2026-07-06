@@ -1700,15 +1700,19 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
             )
     if view.quantization == "mxfp8":
         if moe_runner_backend == "auto":
-            moe_runner_backend = "flashinfer_trtllm"
+            if 80 <= get_device_sm() < 100:
+                moe_runner_backend = "marlin"
+            else:
+                moe_runner_backend = "flashinfer_trtllm"
         elif moe_runner_backend not in [
             "cutlass",
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
+            "marlin",
         ]:
             logger.warning(
                 "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
-                "or flashinfer_trtllm_routed backends. "
+                "flashinfer_trtllm_routed, or marlin backends. "
                 f"Overriding {moe_runner_backend!r}."
             )
             moe_runner_backend = "flashinfer_trtllm"

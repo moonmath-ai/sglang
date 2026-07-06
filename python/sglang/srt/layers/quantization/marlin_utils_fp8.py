@@ -26,6 +26,24 @@ ScalarType, scalar_types = get_scalar_types()
 logger = logging.getLogger(__name__)
 
 
+def _normalize_fp8_marlin_scales(
+    scales: torch.Tensor, target_dtype: torch.dtype
+) -> torch.Tensor:
+    if getattr(scales, "format_ue8m0", False) or scales.dtype in (
+        torch.float8_e8m0fnu,
+        torch.uint8,
+        torch.int8,
+    ):
+        if scales.dtype == torch.float8_e8m0fnu:
+            return scales.to(target_dtype)
+        if scales.dtype == torch.uint8:
+            return scales.view(torch.float8_e8m0fnu).to(target_dtype)
+        if scales.dtype == torch.int8:
+            return scales.view(torch.uint8).view(torch.float8_e8m0fnu).to(target_dtype)
+        raise TypeError(f"Unsupported UE8M0 scale dtype for FP8 Marlin: {scales.dtype}")
+    return scales.to(target_dtype)
+
+
 def fp8_fused_exponent_bias_into_scales(scales):
     fp8_exponent = 4
     if scales.dtype == torch.half:
@@ -143,9 +161,11 @@ def prepare_fp8_layer_for_marlin(
     # WEIGHT SCALES
     # Permute scales
     if "weight_scale" in dir(layer):
-        scales = layer.weight_scale.to(layer.orig_dtype)
+        scales = _normalize_fp8_marlin_scales(layer.weight_scale, layer.orig_dtype)
     elif "weight_scale_inv" in dir(layer):
-        scales = layer.weight_scale_inv.to(layer.orig_dtype)
+        scales = _normalize_fp8_marlin_scales(
+            layer.weight_scale_inv, layer.orig_dtype
+        )
         del layer.weight_scale_inv
 
     group_size = -1 if weight_block_size is None else weight_block_size[1]
@@ -202,9 +222,13 @@ def prepare_moe_fp8_layer_for_marlin(
         "performance for compute-heavy workloads."
     )
 
-    e = layer.num_experts
-    k = layer.hidden_size
-    n = layer.intermediate_size_per_partition
+    e = layer.w13_weight.shape[0]
+    if size_k_first:
+        k = layer.w13_weight.shape[1]
+        n = layer.w2_weight.shape[1]
+    else:
+        k = layer.w13_weight.shape[2]
+        n = layer.w2_weight.shape[2]
     weight_block_size = getattr(layer, "weight_block_size", None)
 
     # WORKSPACE
@@ -249,11 +273,15 @@ def prepare_moe_fp8_layer_for_marlin(
     for name in ["w13", "w2"]:
         if name + "_weight_scale" in dir(layer):
             new_name = name + "_weight_scale"
-            scales = getattr(layer, new_name).to(layer.orig_dtype)
+            scales = _normalize_fp8_marlin_scales(
+                getattr(layer, new_name), layer.orig_dtype
+            )
             delattr(layer, new_name)
         elif name + "_weight_scale_inv" in dir(layer):
             new_name = name + "_weight_scale_inv"
-            scales = getattr(layer, new_name).to(layer.orig_dtype)
+            scales = _normalize_fp8_marlin_scales(
+                getattr(layer, new_name), layer.orig_dtype
+            )
             delattr(layer, new_name)
 
         tensor_list = []
