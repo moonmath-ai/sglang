@@ -212,6 +212,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dual_chunk_flash_attn",
     # AMD specific
     "aiter",
+    "moonmath_mla",
     "wave",
     # Other platforms
     "intel_amx",
