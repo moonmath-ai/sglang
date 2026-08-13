@@ -204,6 +204,10 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    # Number of tokens in `device_indices` that came from a fuzzy (non-exact)
+    # match rather than the radix tree. Those slots hold donor KV that must be
+    # position-corrected before the forward pass. None/0 for exact-only caches.
+    fuzzy_matched_len: Optional[int] = None
 
 
 def zero_match_result(

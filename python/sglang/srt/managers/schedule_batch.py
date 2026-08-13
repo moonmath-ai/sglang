@@ -1021,6 +1021,24 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
+        # Fuzzy KV reuse state (only set by the fuzzy_match radix backend).
+        # Number of prompt tokens covered by a fuzzy (non-exact) match this
+        # round; consumed and zeroed by the model runner after realization.
+        self.cache_fuzzy_matched_len: int = 0
+        # The provider's FuzzyMatchResult for this round, if any.
+        self.fuzzy_match_result = None
+        # Donor TreeNode pinned (inc_lock_ref) until this request finishes.
+        self.fuzzy_donor_node = None
+        # Pool slots pre-allocated for RoPE-corrected donor KV; freed by
+        # cache_finished_req if the forward pass never consumed them.
+        self.fuzzy_realized_locs = None
+        # Absolute position where this request's *new* content began, i.e. its
+        # exact-prefix divergence point on the first match_prefix of the round.
+        # Recorded so donor registration can also chunk from here: a future
+        # request that diverges at the same content position then produces a
+        # byte-identical leading chunk and can match it. None until matched.
+        self.fuzzy_donor_align_pos = None
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -1394,6 +1412,7 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            self.cache_fuzzy_matched_len = match_result.fuzzy_matched_len or 0
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1680,6 +1699,14 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        # Fuzzy state: the realization slots and the donor pin were already
+        # released by cache_finished_req (release_kv_cache above); clear the
+        # scalars so a rescheduled re-match starts from a clean slate.
+        self.cache_fuzzy_matched_len = 0
+        self.fuzzy_match_result = None
+        self.fuzzy_donor_node = None
+        self.fuzzy_realized_locs = None
+        self.fuzzy_donor_align_pos = None
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False

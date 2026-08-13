@@ -1714,6 +1714,28 @@ class ServerArgs:
         "Name of a radix-cache backend previously registered via register_radix_cache_backend. Omit this flag to use the built-in default cache selection chain.",
         NS("memory"),
     ] = None
+
+    # -------------------------------------------------------------------------
+    # Fuzzy KV match (--radix-cache-backend fuzzy_match)
+    # -------------------------------------------------------------------------
+    fuzzy_match_provider: A[
+        str,
+        (
+            "FuzzyMatchProvider implementation used by the fuzzy_match "
+            "radix-cache backend. 'ExactHash' finds donor KV by exact content "
+            "match at a different offset (content-defined chunking, no "
+            "external dependency) — lossless; the only in-tree provider."
+        ),
+        NS("memory"),
+    ] = "ExactHash"
+    fuzzy_min_match_length: A[
+        int,
+        (
+            "Minimum token span a fuzzy match may reuse. Partial exact-prefix "
+            "anchors shorter than this skip the fuzzy lookup."
+        ),
+        NS("memory"),
+    ] = 16
     mm_attention_backend: A[
         Optional[str],
         Arg(

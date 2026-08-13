@@ -399,6 +399,22 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # Fuzzy-match E2E tests: force every chunk fingerprint to the same
+    # constant, so two genuinely different chunks collide by construction —
+    # exercises the mandatory token-ID equality-check fallback at the real
+    # system level (through the live scheduler), which can't otherwise be
+    # forced without an astronomically unlikely real hash collision.
+    SGLANG_TEST_FUZZY_FORCE_HASH_COLLISION = EnvBool(False)
+    # Fuzzy-match E2E tests: reproduce the "naive reuse" baseline (paper's
+    # Irminsul Table 2 "naive" column) -- copy donor KV verbatim with no
+    # RoPE delta-rotation correction at all, by swapping in identity
+    # apply_rotary_emb/reverse_rotary_emb hooks.
+    SGLANG_TEST_FUZZY_NAIVE_KV_REUSE = EnvBool(False)
+    # Fuzzy-match MLA realization: use the fused gather-rotate-scatter Triton
+    # kernel (one launch across all layers) instead of the per-layer
+    # get_mla_kv_buffer/set_mla_kv_buffer loop. Default off; the per-layer
+    # path stays as the reference oracle.
+    SGLANG_FUZZY_REALIZE_FUSED = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # Physical KV-page checks: committed<=allocated + no page alias.

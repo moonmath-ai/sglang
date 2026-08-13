@@ -842,12 +842,26 @@ class ModelRunner:
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
 
+        # Init fuzzy KV realizer (radix-cache backend "fuzzy_match")
+        self.maybe_init_fuzzy_kv_realizer()
+
         self.maybe_init_hisparse_coordinator()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+
+    def maybe_init_fuzzy_kv_realizer(self):
+        self.fuzzy_kv_realizer = None
+        if self.server_args.radix_cache_backend == "fuzzy_match":
+            from sglang.srt.mem_cache.fuzzy_match.realizer import FuzzyKVRealizer
+
+            self.fuzzy_kv_realizer = FuzzyKVRealizer(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                model=self.model,
+            )
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
@@ -1669,6 +1683,11 @@ class ModelRunner:
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
+            # Realize fuzzy-matched donor KV (copy + RoPE correction) on the
+            # forward stream, before the extend dispatch below reads the pool.
+            if self.fuzzy_kv_realizer is not None and forward_batch.fuzzy_reqs:
+                self.fuzzy_kv_realizer.realize(fuzzy_reqs=forward_batch.fuzzy_reqs)
 
             dwdp_mgr = get_global_dwdp_manager()
             if dwdp_mgr is not None:
