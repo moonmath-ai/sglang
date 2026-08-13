@@ -98,10 +98,11 @@ def get_input_ids(
     return input_ids
 
 
-def compare_kl_divergence(
-    input_logprobs, output_logprobs, ACC_THRESHOLDS, model_name, test_name
-):
-    """Compare the KL divergence between input and output log probabilities."""
+def compute_avg_kl(input_logprobs, output_logprobs):
+    """Per-sample-averaged KL(input || output) approximation, shared by
+    compare_kl_divergence and any caller that needs the number itself
+    (e.g. comparing a naive-reuse baseline's KL against a corrected path's,
+    rather than gating on a single threshold)."""
     kl_divs = []
     for input_logprob, output_logprob in zip(input_logprobs, output_logprobs):
         input_logprob = np.array(input_logprob)
@@ -109,9 +110,16 @@ def compare_kl_divergence(
         logr = input_logprob - output_logprob
         kl_approx = (np.exp(logr) - 1) - logr
         kl_divs.append(np.mean(kl_approx))
+    return kl_divs, sum(kl_divs) / len(kl_divs)
+
+
+def compare_kl_divergence(
+    input_logprobs, output_logprobs, ACC_THRESHOLDS, model_name, test_name
+):
+    """Compare the KL divergence between input and output log probabilities."""
+    kl_divs, avg_kl_div = compute_avg_kl(input_logprobs, output_logprobs)
 
     print(f"kl_divs={kl_divs}")
-    avg_kl_div = sum(kl_divs) / len(kl_divs)
     print(f"avg_kl_div={avg_kl_div}")
     print(f"ACC_THRESHOLDS={ACC_THRESHOLDS[model_name]}")
     assert avg_kl_div < ACC_THRESHOLDS[model_name]["kl_div"], (
@@ -138,6 +146,7 @@ def _generate(
     logprob_start_len=-1,
     temperature=0.0,
     routed_dp_rank=None,
+    top_logprobs_num=0,
 ):
     """Send generate request and return results."""
     json_data = {
@@ -158,6 +167,8 @@ def _generate(
         )
     if routed_dp_rank is not None:
         json_data["routed_dp_rank"] = routed_dp_rank
+    if top_logprobs_num:
+        json_data["top_logprobs_num"] = top_logprobs_num
     response = requests.post(base_url + "/generate", json=json_data)
     return response.json()
 
@@ -188,6 +199,68 @@ def _get_input_logprobs(
         logprob = [x[0] for x in logprob][-len(output_logprobs[i]) :]
         input_logprobs.append(logprob)
     return input_logprobs
+
+
+def _get_input_logprobs_and_top1(
+    base_url, new_input_ids, output_logprobs, temperature=0.0
+):
+    """Like _get_input_logprobs, but also returns the reference model's
+    top-1 (argmax) token id at each position, via the same rescoring call
+    (top_logprobs_num=1 added to the existing max_new_tokens=0 request --
+    no extra server round trip)."""
+    _flush_cache(base_url)
+    results = _generate(
+        base_url,
+        new_input_ids,
+        max_new_tokens=0,
+        return_logprob=True,
+        logprob_start_len=0,
+        temperature=temperature,
+        top_logprobs_num=1,
+    )
+    assert len(results) == len(new_input_ids)
+
+    input_logprobs = []
+    reference_top1_ids = []
+    for i, result in enumerate(results):
+        tail_len = len(output_logprobs[i])
+        logprob = result["meta_info"]["input_token_logprobs"]
+        input_logprobs.append([x[0] for x in logprob][-tail_len:])
+        # input_top_logprobs[0] is a bare None (no top-k is defined for the
+        # very first token), unlike input_token_logprobs[0] which is a
+        # (None, token_id, None) tuple -- slice to the tail *before*
+        # indexing so that leading None is never touched.
+        top1 = result["meta_info"]["input_top_logprobs"][-tail_len:]
+        reference_top1_ids.append([pos[0][1] for pos in top1])
+    return input_logprobs, reference_top1_ids
+
+
+def compare_argmax_match_and_divergence(
+    treatment_output_ids, reference_top1_ids, model_name, test_name
+):
+    """argmax-match-rate: fraction of positions where the treatment path's
+    own chosen token (trivially available at temperature=0.0 greedy
+    decoding) equals the reference (full-recompute) rescoring's top-1
+    token. first-divergence: the (sample_index, position) of the first
+    disagreement, or None if they never disagree. Print-only diagnostic --
+    KL divergence is already the gating check; this reproduces the paper's
+    Table 2 columns for the write-up, not an independent pass/fail bar."""
+    total, matches, first_divergence = 0, 0, None
+    for sample_idx, (treatment_ids, ref_ids) in enumerate(
+        zip(treatment_output_ids, reference_top1_ids)
+    ):
+        for pos, (t, r) in enumerate(zip(treatment_ids, ref_ids)):
+            total += 1
+            if t == r:
+                matches += 1
+            elif first_divergence is None:
+                first_divergence = (sample_idx, pos)
+    match_rate = matches / total if total else 1.0
+    print(
+        f"[{model_name} {test_name}] argmax_match_rate={match_rate:.4f} "
+        f"first_divergence={'none' if first_divergence is None else first_divergence}"
+    )
+    return match_rate, first_divergence
 
 
 def _extract_output_logprobs(result):
