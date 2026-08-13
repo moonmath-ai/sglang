@@ -1752,6 +1752,61 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
+def _build_kv_copy_config(data_ptrs, data_strides, device, layer_num):
+    """Tiling heuristics + Triton warmup for `copy_all_layer_kv_cache_func`.
+
+    Shared by MHATokenToKVPool and MLATokenToKVPool. Returns None for a
+    zero-layer pool (e.g. an all-SWA model's full sub-pool); otherwise builds
+    the config dict and fires one dummy launch so the first real move doesn't
+    pay Triton compile.
+    """
+    if layer_num == 0:
+        return None
+
+    # Heuristics for KV copy tiling
+    _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
+    _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
+    _KV_COPY_TILE_SIZE_LARGE = 512
+    _KV_COPY_TILE_SIZE_MEDIUM = 256
+    _KV_COPY_TILE_SIZE_SMALL = 128
+    _KV_COPY_NUM_WARPS_LARGE_TILE = 8
+    _KV_COPY_NUM_WARPS_SMALL_TILE = 4
+
+    stride_bytes = int(data_strides[0].item())
+    if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
+        bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
+    elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
+        bytes_per_tile = _KV_COPY_TILE_SIZE_MEDIUM
+    else:
+        bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
+
+    # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
+    chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
+
+    kv_copy_config = {
+        "bytes_per_tile": bytes_per_tile,
+        "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
+        "num_warps": (
+            _KV_COPY_NUM_WARPS_SMALL_TILE
+            if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
+            else _KV_COPY_NUM_WARPS_LARGE_TILE
+        ),
+        "num_locs_upper": chunk_upper,
+    }
+
+    dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=device)
+    copy_all_layer_kv_cache_func(
+        data_ptrs,
+        data_strides,
+        dummy_loc,
+        dummy_loc,
+        1,
+        chunk_upper,
+        kv_copy_config,
+    )
+    return kv_copy_config
+
+
 class MHATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -1877,51 +1932,8 @@ class MHATokenToKVPool(KVCache):
         self.v_row_dim = self.head_num * self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
-        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
-        if self.layer_num == 0:
-            self._kv_copy_config = None
-            return
-
-        # Heuristics for KV copy tiling
-        _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
-        _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
-        _KV_COPY_TILE_SIZE_LARGE = 512
-        _KV_COPY_TILE_SIZE_MEDIUM = 256
-        _KV_COPY_TILE_SIZE_SMALL = 128
-        _KV_COPY_NUM_WARPS_LARGE_TILE = 8
-        _KV_COPY_NUM_WARPS_SMALL_TILE = 4
-
-        stride_bytes = int(self.data_strides[0].item())
-        if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
-        elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_MEDIUM
-        else:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
-
-        # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
-        chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
-
-        self._kv_copy_config = {
-            "bytes_per_tile": bytes_per_tile,
-            "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
-            "num_warps": (
-                _KV_COPY_NUM_WARPS_SMALL_TILE
-                if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
-                else _KV_COPY_NUM_WARPS_LARGE_TILE
-            ),
-            "num_locs_upper": chunk_upper,
-        }
-
-        dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
-        copy_all_layer_kv_cache_func(
-            self.data_ptrs,
-            self.data_strides,
-            dummy_loc,
-            dummy_loc,
-            1,
-            chunk_upper,
-            self._kv_copy_config,
+        self._kv_copy_config = _build_kv_copy_config(
+            self.data_ptrs, self.data_strides, self.device, self.layer_num
         )
 
     @property
@@ -3944,6 +3956,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        enable_kv_cache_copy: bool = False,
     ):
         super().__init__(
             size,
@@ -3978,6 +3991,17 @@ class MLATokenToKVPool(KVCache):
             [x.data_ptr() for x in self.kv_buffer],
             dtype=torch.uint64,
             device=self.device,
+        )
+        self.data_strides = torch.tensor(
+            [x.stride(0) * x.element_size() for x in self.kv_buffer],
+            device=self.device,
+        )
+        self._kv_copy_config = (
+            _build_kv_copy_config(
+                self.data_ptrs, self.data_strides, self.device, self.layer_num
+            )
+            if enable_kv_cache_copy
+            else None
         )
         if not use_dsa:
             # DSA will allocate indexer KV cache later and then log the total size
@@ -4174,6 +4198,34 @@ class MLATokenToKVPool(KVCache):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+
+        if self._kv_copy_config is not None:
+            # One launch across all layers (same shape as the MHA batched
+            # move); chunk so num_locs_upper stays a bounded pow2. A single
+            # launch is in-place safe (each program covers every loc for one
+            # byte tile: all loads precede stores within it, and byte tiles
+            # are disjoint), but chunking is not: a later chunk would read
+            # rows an earlier chunk already wrote, which breaks the legacy
+            # indexing loop's whole-range gather-then-scatter semantics. Fall
+            # back to the legacy loop when overlapping locs force chunking.
+            cfg = self._kv_copy_config
+            cap = int(cfg.get("num_locs_upper", 256))
+            n = tgt_loc_flat.numel()
+            if n <= cap or not torch.isin(tgt_loc_flat, src_loc_flat).any().item():
+                for start in range(0, n, cap):
+                    end = min(start + cap, n)
+                    chunk_len = end - start
+                    copy_all_layer_kv_cache_func(
+                        self.data_ptrs,
+                        self.data_strides,
+                        tgt_loc_flat[start:end],
+                        src_loc_flat[start:end],
+                        chunk_len,
+                        next_power_of_2(chunk_len),
+                        cfg,
+                    )
+                return
+
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
