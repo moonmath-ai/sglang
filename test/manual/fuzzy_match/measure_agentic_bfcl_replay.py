@@ -49,6 +49,7 @@ Compare two runs:
 
 from __future__ import annotations
 
+import os
 import argparse
 import json
 import random
@@ -59,7 +60,7 @@ from collections import Counter
 
 import requests
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer

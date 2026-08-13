@@ -37,10 +37,11 @@ telescoping (sum of true per-request energies always equals the batch's
 total delta), unlike per-request reads.
 """
 
+import os
 import random
 import sys
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 import pynvml
 

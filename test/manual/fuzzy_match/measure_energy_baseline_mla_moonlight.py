@@ -12,10 +12,11 @@ fuzzy_match backend):
     python test/manual/fuzzy_match/measure_energy_baseline_mla_moonlight.py http://127.0.0.1:21000
 """
 
+import os
 import random
 import sys
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 import pynvml
 

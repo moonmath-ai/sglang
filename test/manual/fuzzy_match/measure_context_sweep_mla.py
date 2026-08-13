@@ -48,11 +48,12 @@ Not a CI test; run manually against an already-running fuzzy_match+ExactHash ser
     python test/manual/fuzzy_match/measure_context_sweep_mla.py http://127.0.0.1:21000
 """
 
+import os
 import random
 import statistics
 import sys
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from sglang.test.kl_test_utils import _flush_cache, _generate
 

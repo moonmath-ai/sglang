@@ -30,10 +30,11 @@ so this works identically against either backend:
     python test/manual/fuzzy_match/demonstrate_shift_miss_vs_hit.py http://127.0.0.1:21000
 """
 
+import os
 import random
 import sys
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from sglang.test.kl_test_utils import _flush_cache, _generate
 

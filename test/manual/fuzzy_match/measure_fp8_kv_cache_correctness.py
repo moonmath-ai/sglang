@@ -38,10 +38,11 @@ floating-point rotation math on an *already-quantized* value, and it isn't
 upcasting first.
 """
 
+import os
 import random
 import sys
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from sglang.test.kl_test_utils import (
     _extract_output_logprobs,

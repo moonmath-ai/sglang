@@ -27,10 +27,11 @@ Run against a live fuzzy_match server:
 Exits non-zero if the block is not reused, so it can gate a change.
 """
 
+import os
 import random
 import sys
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from sglang.test.kl_test_utils import _flush_cache, _generate
 

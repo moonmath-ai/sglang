@@ -33,12 +33,13 @@ Simulation, per shared-context group, processing requests in arrival order:
     itself is meant to add. Then register this request's own new chunks.
 """
 
+import os
 import hashlib
 import random
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from datasets import load_dataset
 from transformers import AutoTokenizer

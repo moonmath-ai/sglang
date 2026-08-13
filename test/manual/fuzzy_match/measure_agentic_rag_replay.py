@@ -46,6 +46,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import argparse
 import json
 import statistics
@@ -54,7 +55,7 @@ import time
 
 import requests
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from datasets import load_dataset
 from transformers import AutoTokenizer

@@ -20,12 +20,13 @@ time for a max_new_tokens=1 request — for a single generated token, that's
 dominated by prefill, a reasonable proxy without needing a new metrics field.
 """
 
+import os
 import random
 import statistics
 import sys
 import time
 
-sys.path.insert(0, "/home/karthik/sglang-private/python")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python"))
 
 from sglang.test.kl_test_utils import _flush_cache, _generate
 
