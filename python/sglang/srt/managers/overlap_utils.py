@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_gfx942_supported, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -64,6 +64,7 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_gfx942 = is_gfx942_supported()
 _is_npu = is_npu()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
@@ -467,9 +468,17 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if _is_hip and not _is_gfx942:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                # Keep it on gfx95x, but do not serialize the host on gfx942.
                 self.publish_ready.synchronize()
+            elif _is_gfx942:
+                # Queue the dependency on the schedule stream. run_batch later makes
+                # forward_stream wait on this stream, preserving ordering without a
+                # host fence between speculative cycles.
+                torch.get_device_module(self.device).current_stream().wait_event(
+                    self.publish_ready
+                )
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]

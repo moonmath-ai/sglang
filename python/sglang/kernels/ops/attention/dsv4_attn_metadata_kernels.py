@@ -22,6 +22,7 @@ def _inputs_on_cuda(*args, **kwargs) -> bool:
 class ExpandPrefillCausallyResult(msgspec.Struct):
     seq_lens_casual: torch.Tensor
     req_pool_indices_repeated: torch.Tensor
+    batch_indices_repeated: torch.Tensor
 
 
 class ExpandPrefillCausally:
@@ -93,6 +94,11 @@ def expand_prefill_causally(
 
     if extend_start_loc is not None:
         repeats = extend_seq_lens.to(torch.int64)
+        batch_indices_repeated = torch.repeat_interleave(
+            torch.arange(len(extend_seq_lens), device=device, dtype=torch.int64),
+            repeats,
+            output_size=num_tokens,
+        )
         req_pool_indices_repeated = torch.repeat_interleave(
             req_pool_indices, repeats, output_size=num_tokens
         )
@@ -119,9 +125,16 @@ def expand_prefill_causally(
                     req_pool_indices_repeated[-1:].expand(pad_size),
                 )
             )
+            batch_indices_repeated = torch.cat(
+                (
+                    batch_indices_repeated,
+                    batch_indices_repeated[-1:].expand(pad_size),
+                )
+            )
         return ExpandPrefillCausallyResult(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
+            batch_indices_repeated=batch_indices_repeated,
         )
 
     assert seq_lens_cpu is not None and extend_seq_lens_cpu is not None
@@ -147,9 +160,15 @@ def expand_prefill_causally(
             (0, pad_size),
             value=req_pool_indices_repeated[-1].item(),
         )
+        idx_to_req_repeated = torch.nn.functional.pad(
+            idx_to_req_repeated,
+            (0, pad_size),
+            value=len(seq_lens_cpu) - 1,
+        )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,
         req_pool_indices_repeated=req_pool_indices_repeated,
+        batch_indices_repeated=idx_to_req_repeated.to(torch.int64),
     )
 
 
@@ -160,6 +179,7 @@ def _expand_prefill_causally_kernel(
     extend_seq_lens_ptr,
     seq_lens_casual_ptr,
     req_pool_repeated_ptr,
+    batch_indices_repeated_ptr,
     bs,
     num_tokens,
     total_tokens,
@@ -189,6 +209,7 @@ def _expand_prefill_causally_kernel(
     rp = tl.load(req_pool_ptr + r, mask=mask, other=0)
     tl.store(seq_lens_casual_ptr + offs, causal, mask=mask)
     tl.store(req_pool_repeated_ptr + offs, rp, mask=mask)
+    tl.store(batch_indices_repeated_ptr + offs, r, mask=mask)
 
 
 def expand_prefill_causally_triton(
@@ -211,6 +232,9 @@ def expand_prefill_causally_triton(
     req_pool_indices_repeated = torch.empty(
         total_tokens, dtype=req_pool_indices.dtype, device=device
     )
+    batch_indices_repeated = torch.empty(
+        total_tokens, dtype=torch.int64, device=device
+    )
     BLOCK = 256
     _expand_prefill_causally_kernel[(triton.cdiv(total_tokens, BLOCK),)](
         req_pool_indices,
@@ -218,6 +242,7 @@ def expand_prefill_causally_triton(
         extend_seq_lens,
         seq_lens_casual,
         req_pool_indices_repeated,
+        batch_indices_repeated,
         bs,
         num_tokens,
         total_tokens,
@@ -227,6 +252,7 @@ def expand_prefill_causally_triton(
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,
         req_pool_indices_repeated=req_pool_indices_repeated,
+        batch_indices_repeated=batch_indices_repeated,
     )
 
 

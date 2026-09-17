@@ -466,6 +466,10 @@ class DeepseekV4HipRadixBackend(
             and model_runner.spec_algorithm.is_dspark()
         )
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
+        # DSpark verify metadata is assembled entirely on-device. Advertising the
+        # inherited default (True) forces FutureMap to publish a CPU mirror every
+        # cycle and defeats the overlap scheduler's GPU-only relay.
+        self.needs_cpu_seq_lens = not model_runner.spec_algorithm.is_dspark()
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
             assert self.speculative_num_draft_tokens > 1
@@ -541,6 +545,7 @@ class DeepseekV4HipRadixBackend(
             )
             seq_lens_casual = _expanded.seq_lens_casual
             req_pool_indices_repeated = _expanded.req_pool_indices_repeated
+            batch_indices_repeated = _expanded.batch_indices_repeated
         else:
             seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
                 num_tokens=num_tokens,
@@ -549,6 +554,7 @@ class DeepseekV4HipRadixBackend(
                 req_pool_indices=req_pool_indices,
                 padded_num_tokens=out_cache_loc.shape[0],
             )
+            batch_indices_repeated = None
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -564,6 +570,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens,
             extend_seq_lens,
             num_tokens,
+            batch_indices_repeated=batch_indices_repeated,
             need_compress=need_compress,
         )
         if attach_decode_streams:
@@ -628,8 +635,6 @@ class DeepseekV4HipRadixBackend(
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly. The raw/lazy-upgrade route can
         # hit planner invariants during graph capture for DSV4+EAGLE.
-        if seq_lens_cpu is None:
-            seq_lens_cpu = seq_lens.tolist()
         return self.init_forward_metadata_target_verify_old(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -674,12 +679,26 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu = None
         else:
             seq_lens = seq_lens + self.target_verify_num_draft_tokens
-            seq_lens_cpu = [
-                x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
-            ]
-            extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
             num_tokens = self.target_verify_num_draft_tokens * batch_size
-            extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
+            if seq_lens_cpu is None:
+                extend_seq_lens = torch.full(
+                    (batch_size,),
+                    self.target_verify_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                extend_start_loc = torch.arange(
+                    batch_size, dtype=torch.int32, device=seq_lens.device
+                ) * self.target_verify_num_draft_tokens
+                extend_seq_lens_cpu = None
+            else:
+                seq_lens_cpu = [
+                    x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
+                ]
+                extend_seq_lens_cpu = [
+                    self.target_verify_num_draft_tokens
+                ] * batch_size
+                extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
@@ -693,7 +712,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
-            compress_gpu_plan=ragged_layout is not None,
+            compress_gpu_plan=extend_start_loc is not None,
             extend_start_loc=extend_start_loc,
             attach_decode_streams=True,
         )
@@ -789,14 +808,27 @@ class DeepseekV4HipRadixBackend(
         max_seq_len: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
+        seq_lens_cpu: Optional[List[int]],
         num_tokens_per_req: int,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
-        extend_seq_lens_cpu = [num_tokens_per_req] * batch_size
-        extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
+        extend_start_loc = None
+        if seq_lens_cpu is None:
+            extend_seq_lens = torch.full(
+                (batch_size,),
+                num_tokens_per_req,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            extend_start_loc = torch.arange(
+                batch_size, dtype=torch.int32, device=seq_lens.device
+            ) * num_tokens_per_req
+            extend_seq_lens_cpu = None
+        else:
+            extend_seq_lens_cpu = [num_tokens_per_req] * batch_size
+            extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
         num_tokens = num_tokens_per_req * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
@@ -811,6 +843,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=False,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            extend_start_loc=extend_start_loc,
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
@@ -902,14 +935,17 @@ class DeepseekV4HipRadixBackend(
             )
             out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
 
-        assert seq_lens_cpu is not None
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
-        actual_max_seq_len = seq_lens_cpu.max().item()
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-        assert actual_max_seq_len <= chosen_max_seq_len
+        if seq_lens_cpu is not None:
+            actual_max_seq_len = seq_lens_cpu.max().item()
+            assert actual_max_seq_len <= chosen_max_seq_len
+        else:
+            torch._assert_async((seq_lens <= chosen_max_seq_len).all())
 
         graph_key = bs
 
@@ -949,9 +985,9 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
-                # CPU mirror already available here (== seq_lens, no D2H);
-                # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
-                seq_lens_cpu=seq_lens_cpu.tolist(),
+                seq_lens_cpu=(
+                    seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+                ),
                 ragged_layout=ragged_layout,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
@@ -969,7 +1005,9 @@ class DeepseekV4HipRadixBackend(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu.tolist(),
+                seq_lens_cpu=(
+                    seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+                ),
                 num_tokens_per_req=num_tokens_per_req,
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=True,
@@ -1175,6 +1213,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
+        batch_indices_repeated: Optional[torch.Tensor] = None,
         need_compress: bool = True,
     ) -> None:
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -1190,10 +1229,13 @@ class DeepseekV4HipRadixBackend(
         # token -> req index (length L = sum(extend_seq_lens)).
         # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
         # target-extend path triggers a GPU memory access fault.
-        if need_compress:
+        if batch_indices_repeated is not None:
+            bid = batch_indices_repeated
+        elif need_compress:
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 extend_seq_lens,
+                output_size=num_tokens,
             )
         else:
             bid = torch.repeat_interleave(
